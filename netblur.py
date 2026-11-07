@@ -1,19 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Manuel Veronesi
-"""Local, conservative password masking for network device configuration files.
+"""netblur: mask secrets and personal data in network device configurations before sharing them.
 
-Usage: mask_passwords.py [--personal] FILE [FILE ...]
-For each file, writes a copy next to the original with the _SANITIZED suffix,
-or _NO-SECRETS-FOUND when nothing was masked. ZIP archives are read in memory:
-each file inside is sanitized and written next to the archive, and the original
-contents are never extracted to disk.
-With --personal, names, usernames, email addresses and phone numbers are also
-replaced with consistent placeholders (NAME_1, USER_1, EMAIL_1, PHONE_1) and the
-copy gets the _ANONYMIZED suffix. A local map file links each placeholder to the
-real value: keep it on this PC and never share it.
-The copy is NOT meant to be restored onto a device.
+Usage: netblur [options] INPUT [INPUT ...]
+
+INPUT can be a configuration file, a ZIP archive, a directory (processed
+recursively) or "-" for standard input. By default each copy is written next
+to its original with the _SANITIZED suffix, or _NO-SECRETS-FOUND when nothing
+was masked. Originals are never modified and existing files are never
+overwritten. ZIP archives are read in memory and only sanitized copies reach
+the disk. The copies are NOT meant to be restored onto a device.
+
+Level 1 (default): passwords, keys, communities, PINs, tokens and hashes.
+Level 2 (--personal): names, usernames, email addresses and phone numbers are
+also replaced with consistent placeholders (NAME_1, USER_1, EMAIL_1, PHONE_1)
+shared by every file of the run, and the copies get the _ANONYMIZED suffix.
+A JSON map links each placeholder to the real value: keep it local, never share it.
 """
 import argparse
+import json
 import codecs
 import re
 import sys
@@ -21,7 +26,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '2.6'
+VERSION = '3.0'
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s]+')
 
@@ -120,7 +125,7 @@ BENIGN = re.compile(r'service password-encryption|password encryption|authentica
                     r'crypto key generate|^\s*key chain\b|^\s*key \d+\s*$|authmethod psk|psk-type|'
                     r'mode pre-shared-secret|-password ""|authentication-types=|^/(?:ppp secret|snmp community)|'
                     r'^\s*config system snmp community|"key"\s*:\s*"|_required"\s*:|'
-                    r'^\s*config\s|^\s*set \S*cipher\S*\s|^\s*set \S*(?:password|passwd|pwd)\S* \d+\s*$', re.I)
+                    r'^\s*config\s|^\s*set type password\s*$|^\s*set \S*cipher\S*\s|^\s*set \S*(?:password|passwd|pwd)\S* \d+\s*$', re.I)
 REVIEW_IGNORE = re.compile(r'\w*(?:secret|pass\w*|pwd|pin|key|token)\w*=(?:""|\'\')|<(Name|name|Description|description)>[^<]*</\1>', re.I)
 CERT_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]*CERTIFICATE[A-Z ]*-----')
 CERT_END = re.compile(r'-----END [A-Z0-9 ]*CERTIFICATE[A-Z ]*-----')
@@ -633,13 +638,17 @@ class Privacy:
             text = ''.join(parts)
         return text, counts
 
-    def map_text(self, source):
-        out = ['PERSONAL DATA MAP for: %s' % source,
-               'This file contains the real personal data. Keep it on this PC and NEVER share it.', '']
-        for kind in ('NAME', 'USER', 'EMAIL', 'PHONE'):
-            for value, tok in self.maps[kind].items():
-                out.append('%s\t%s' % (tok, value))
-        return '\n'.join(out) + '\n'
+    def map_dict(self, sources):
+        """Placeholder -> real value, grouped by kind, ready to be written as JSON."""
+        out = {
+            '_warning': 'This file links placeholders to REAL personal data. Keep it local, never share it.',
+            'tool': 'netblur', 'version': VERSION,
+            'created': datetime.now().isoformat(timespec='seconds'),
+            'sources': list(sources),
+        }
+        for kind, key in (('NAME', 'names'), ('USER', 'users'), ('EMAIL', 'emails'), ('PHONE', 'phones')):
+            out[key] = {tok: value for value, tok in self.maps[kind].items()}
+        return out
 
 
 def is_multipart(raw):
@@ -655,7 +664,7 @@ def redact_multipart(raw, privacy=None):
     if len(sep) < 8:
         raise ValueError('Multi-part backup without a usable block separator: no file written.')
     header = re.sub(rb'(?m)^(private_key=)([^\r\n]+)', rb'\1REDACTED', raw[:hend])
-    out, changed, review, blocks = [header], [], [], []
+    out, changed, review, blocks, hits = [header], [], [], [], [0]
     lines_so_far = header.count(b'\n')
     pos = hend
     while True:
@@ -682,7 +691,8 @@ def redact_multipart(raw, privacy=None):
             result, ch, rv = redact(text)
             if privacy is not None:
                 privacy.collect(result)
-                result, _ = privacy.apply(result)
+                result, counts = privacy.apply(result)
+                hits[0] += sum(counts.values())
             changed += [n + lines_so_far for n in ch]
             review += [n + lines_so_far for n in rv]
             block = result.encode(enc)
@@ -696,177 +706,326 @@ def redact_multipart(raw, privacy=None):
         out.append(block)
         lines_so_far += block.count(b'\n')
         pos = s2
-    return b''.join(out), changed, review, blocks
+    return b''.join(out), changed, review, blocks, hits[0]
 
 
 MAX_ENTRY_SIZE = 512 * 1024 * 1024  # refuse suspiciously large archive members
+OUTPUT_MARKERS = ('_SANITIZED', '_ANONYMIZED', '_NO-SECRETS-FOUND', 'PERSONAL-DATA-MAP')
+STDIO = '-'
+
+
+class Result:
+    """What came out of one input file."""
+
+    def __init__(self, data, changed, review, blocks, text, personal_hits):
+        self.data, self.changed, self.review = data, changed, review
+        self.blocks, self.text, self.personal_hits = blocks, text, personal_hits
 
 
 def sanitize_bytes(raw, privacy=None):
-    """Return (data, changed, review, blocks, text_for_format)."""
     if is_multipart(raw):
-        data, changed, review, blocks = redact_multipart(raw, privacy)
-        return data, changed, review, blocks, None
+        data, changed, review, blocks, hits = redact_multipart(raw, privacy)
+        return Result(data, changed, review, blocks, None, hits)
     text, enc = decode(raw)
     result, changed, review = redact(text)
+    hits = 0
     if privacy is not None:
         privacy.collect(result)
-        result, _ = privacy.apply(result)
-    return result.encode(enc), changed, review, None, text
+        result, counts = privacy.apply(result)
+        hits = sum(counts.values())
+    return Result(result.encode(enc), changed, review, None, text, hits)
+
+
+def is_own_output(name):
+    return any(m in name for m in OUTPUT_MARKERS)
 
 
 def unique_path(folder, name, suffix):
+    """A path that does not exist yet: date and time are added when the plain name is taken."""
     dst = folder / (name + suffix)
     if dst.exists():
         dst = folder / (name + '_' + datetime.now().strftime('%Y%m%d-%H%M%S') + suffix)
     return dst
 
 
-def write_copy(folder, stem, suffix, data, changed, privacy=None):
-    # A copy with nothing masked gets a different suffix, so its name never claims it was sanitized.
-    personal = privacy is not None and privacy.total()
-    if personal:
-        tag = '_ANONYMIZED'
-    else:
-        tag = '_SANITIZED' if changed else '_NO-SECRETS-FOUND'
-    dst = unique_path(folder, stem + tag, suffix)
-    with dst.open('xb') as f:  # exclusive create: never overwrites
-        f.write(data)
-    if personal:
-        mp = unique_path(folder, dst.stem + '_PERSONAL-DATA-MAP', '.txt')
-        with mp.open('xb') as f:
-            f.write(privacy.map_text(dst.name).encode('utf-8'))
-        print('Map of placeholders (keep local, never share):', mp.name)
-    return dst
+class Run:
+    """One invocation: options, the personal-data map shared by every file, counters and the log."""
 
+    def __init__(self, args):
+        self.args = args
+        self.privacy = Privacy() if args.personal else None
+        self.to_stdout = args.output == STDIO
+        self.log = sys.stderr if self.to_stdout else sys.stdout
+        self.failed = self.skipped = self.flagged = self.no_secrets = self.written = 0
+        self.outputs = []          # paths written, in order
+        self.sources = []          # input labels, for the map file
+        self.output_dir = None     # set when -o names a directory
+        self.explicit_file = None  # set when -o names one output file
 
-def report(dst, changed, review, blocks, text, privacy=None):
-    if blocks is None:
-        print('Likely format:', detect_format(text))
-    else:
-        print('Likely format: Fortinet multi-part backup (e.g. FortiWeb entire configuration)')
-        for kind, name, size in blocks:
-            if kind == 'text':
-                print('  Block processed as text: %s (%d bytes)' % (name, size))
-            else:
-                print('  Block OMITTED (%s): %s (%d bytes)' % (kind, name, size))
-    print('Copy created:', dst.name)
-    print('Lines masked:', len(changed))
-    if privacy is not None:
-        m = privacy.maps
-        print('Personal data replaced: %d names, %d usernames, %d emails, %d phone numbers (distinct values)'
-              % (len(m['NAME']), len(m['USER']), len(m['EMAIL']), len(m['PHONE'])))
-    if review:
-        shown = ', '.join(map(str, review[:40]))
-        extra = ' and %d more' % (len(review) - 40) if len(review) > 40 else ''
-        print('Lines to review locally:', shown + extra)
-    else:
-        print('Lines to review locally: none flagged')
-    if not changed and not (privacy is not None and privacy.total()):
-        print('WARNING: no secrets found. Check that the file is a configuration and that its')
-        print('syntax is supported, and review the copy before sharing it.')
+    def say(self, *parts):
+        print(*parts, file=self.log)
 
+    # ---------------------------------------------------------------- destinations
+    def tag(self, result):
+        if not result.changed and not result.personal_hits:
+            return '_NO-SECRETS-FOUND'
+        return '_ANONYMIZED' if self.args.personal else '_SANITIZED'
 
-def process_zip(src, personal=False):
-    """Sanitize every file inside a ZIP archive in memory, writing only sanitized copies."""
-    failed = 0
-    print('File:', src.name, '(ZIP archive, read in memory)')
-    try:
-        archive = zipfile.ZipFile(src)
-    except zipfile.BadZipFile:
-        raise ValueError('The ZIP archive is damaged or not a real ZIP file.')
-    with archive:
-        members = [i for i in archive.infolist() if not i.is_dir()]
-        if not members:
-            raise ValueError('The ZIP archive contains no files.')
-        if any(i.flag_bits & 0x1 for i in members):
-            raise ValueError('The ZIP archive is password protected: extract it manually first.')
-        zip_stem = Path(src.stem)  # "backup.conf.zip" -> "backup.conf"
-        db = [i for i in members if re.fullmatch(r'\d*Db\.xml', i.filename)]
-        if db:
-            # 3CX backup: only the configuration is sanitized. Database tables, recordings,
-            # voicemail, prompts, certificates and phone provisioning files are never written out.
-            print('Likely content: 3CX backup. Only the configuration file is processed.')
-            skipped = {}
-            for i in members:
-                if i in db:
-                    continue
-                top = i.filename.split('/')[0] if '/' in i.filename else '(root)'
-                n, size = skipped.get(top, (0, 0))
-                skipped[top] = (n + 1, size + i.file_size)
-            for top, (n, size) in sorted(skipped.items()):
-                print('  Skipped: %-20s %5d files %10.1f MB' % (top, n, size / 1048576))
-            members = db
-        for info in members:
-            # Only the base name is used, never the path stored in the archive.
-            inner = Path(info.filename.replace('\\', '/').split('/')[-1])
-            print()
-            print('File: %s -> %s' % (src.name, info.filename))
-            try:
-                if info.file_size > MAX_ENTRY_SIZE:
-                    raise ValueError('The file inside the archive is too large to process safely.')
-                raw = archive.read(info)
-                privacy = Privacy() if personal else None
-                data, changed, review, blocks, text = sanitize_bytes(raw, privacy)
-                if len(members) == 1:
-                    stem, suffix = zip_stem.stem, zip_stem.suffix or inner.suffix
+    def destination(self, src, rel_parent, stem, suffix, result):
+        """Where this result goes. None means standard output."""
+        if self.to_stdout:
+            return None
+        if self.explicit_file is not None:
+            dst = self.explicit_file
+            if dst.exists() and not self.args.force:
+                raise ValueError('Output file already exists (use --force to overwrite): ' + dst.name)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            return dst
+        folder = self.output_dir / rel_parent if self.output_dir is not None else src.parent
+        folder.mkdir(parents=True, exist_ok=True)
+        return unique_path(folder, stem + self.tag(result), suffix)
+
+    def write(self, dst, result):
+        if dst is None:
+            sys.stdout.buffer.write(result.data)
+            sys.stdout.buffer.flush()
+        else:
+            mode = 'wb' if (dst == self.explicit_file and self.args.force) else 'xb'  # xb never overwrites
+            with dst.open(mode) as f:
+                f.write(result.data)
+            self.outputs.append(dst)
+        self.written += 1
+
+    # ---------------------------------------------------------------- reporting
+    def report(self, dst, result):
+        if result.blocks is None:
+            self.say('Likely format:', detect_format(result.text))
+        else:
+            self.say('Likely format: Fortinet multi-part backup (e.g. FortiWeb entire configuration)')
+            for kind, name, size in result.blocks:
+                if kind == 'text':
+                    self.say('  Block processed as text: %s (%d bytes)' % (name, size))
                 else:
-                    stem, suffix = zip_stem.stem + '__' + inner.stem, inner.suffix
-                dst = write_copy(src.parent, stem, suffix, data, changed, privacy)
-                report(dst, changed, review, blocks, text, privacy)
+                    self.say('  Block OMITTED (%s): %s (%d bytes)' % (kind, name, size))
+        self.say('Copy created:', dst.name if dst is not None else '(standard output)')
+        self.say('Lines masked:', len(result.changed))
+        if self.privacy is not None:
+            self.say('Personal data replaced in this file: %d value(s)' % result.personal_hits)
+        if result.review:
+            shown = ', '.join(map(str, result.review[:40]))
+            extra = ' and %d more' % (len(result.review) - 40) if len(result.review) > 40 else ''
+            self.say('Lines to review locally:', shown + extra)
+            self.flagged += len(result.review)
+        else:
+            self.say('Lines to review locally: none flagged')
+        if not result.changed and not result.personal_hits:
+            self.no_secrets += 1
+            self.say('WARNING: no secrets found. Check that the file is a configuration and that its')
+            self.say('syntax is supported, and review the copy before sharing it.')
+
+    # ---------------------------------------------------------------- inputs
+    def handle_bytes(self, raw, src, rel_parent, stem, suffix, label):
+        self.say('File:', label)
+        result = sanitize_bytes(raw, self.privacy)
+        dst = self.destination(src, rel_parent, stem, suffix, result)
+        self.write(dst, result)
+        self.report(dst, result)
+        self.sources.append(label)
+
+    def handle_zip(self, src, rel_parent):
+        self.say('File:', src.name, '(ZIP archive, read in memory)')
+        try:
+            archive = zipfile.ZipFile(src)
+        except zipfile.BadZipFile:
+            raise ValueError('The ZIP archive is damaged or not a real ZIP file.')
+        with archive:
+            members = [i for i in archive.infolist() if not i.is_dir()]
+            if not members:
+                raise ValueError('The ZIP archive contains no files.')
+            if any(i.flag_bits & 0x1 for i in members):
+                raise ValueError('The ZIP archive is password protected: extract it manually first.')
+            zip_stem = Path(src.stem)  # "backup.conf.zip" -> "backup.conf"
+            db = [i for i in members if re.fullmatch(r'\d*Db\.xml', i.filename)]
+            if db:
+                # 3CX backup: only the configuration is sanitized. Database tables, recordings,
+                # voicemail, prompts, certificates and phone provisioning files are never written out.
+                self.say('Likely content: 3CX backup. Only the configuration file is processed.')
+                skipped = {}
+                for i in members:
+                    if i in db:
+                        continue
+                    top = i.filename.split('/')[0] if '/' in i.filename else '(root)'
+                    n, size = skipped.get(top, (0, 0))
+                    skipped[top] = (n + 1, size + i.file_size)
+                for top, (n, size) in sorted(skipped.items()):
+                    self.say('  Skipped: %-20s %5d files %10.1f MB' % (top, n, size / 1048576))
+                members = db
+            if (self.to_stdout or self.explicit_file is not None) and len(members) > 1:
+                raise ValueError('A single output works with a single file: this archive holds %d.' % len(members))
+            for info in members:
+                # Only the base name is used, never the path stored in the archive.
+                inner = Path(info.filename.replace('\\', '/').split('/')[-1])
+                self.say()
+                label = '%s -> %s' % (src.name, info.filename)
+                try:
+                    if info.file_size > MAX_ENTRY_SIZE:
+                        raise ValueError('The file inside the archive is too large to process safely.')
+                    if len(members) == 1:
+                        stem, suffix = zip_stem.stem, zip_stem.suffix or inner.suffix
+                    else:
+                        stem, suffix = zip_stem.stem + '__' + inner.stem, inner.suffix
+                    self.handle_bytes(archive.read(info), src, rel_parent, stem, suffix, label)
+                except ValueError as exc:
+                    self.failed += 1
+                    self.say('Operation not completed:', exc)
+                except Exception as exc:
+                    self.failed += 1
+                    self.say('Operation not completed (' + type(exc).__name__ + ').')
+
+    def handle_file(self, src, rel_parent=Path('.')):
+        with src.open('rb') as f:
+            head = f.read(4)
+        if head[:2] == b'PK' and zipfile.is_zipfile(src):
+            return self.handle_zip(src, rel_parent)
+        self.handle_bytes(src.read_bytes(), src, rel_parent, src.stem, src.suffix, src.name)
+
+    def handle_directory(self, root):
+        count = 0
+        for p in sorted(p for p in root.rglob('*') if p.is_file()):
+            rel = p.relative_to(root)
+            if any(part.startswith('.') for part in rel.parts) or is_own_output(p.name):
+                continue
+            count += 1
+            self.say()
+            try:
+                self.handle_file(p, Path(root.name) / rel.parent)
             except ValueError as exc:
-                failed += 1
-                print('Operation not completed:', exc)
+                # Inside a directory, non-text files are expected: skip them without failing the run.
+                self.skipped += 1
+                self.say('Skipped %s: %s' % (rel, exc))
             except Exception as exc:
-                failed += 1
-                print('Operation not completed (' + type(exc).__name__ + ').')
-    return failed
+                self.failed += 1
+                self.say('Operation not completed for %s (%s).' % (rel, type(exc).__name__))
+        if not count:
+            raise ValueError('The directory contains no files to process: ' + str(root))
+
+    def handle_stdin(self):
+        raw = sys.stdin.buffer.read()
+        if not raw:
+            raise ValueError('Nothing was read from standard input.')
+        self.handle_bytes(raw, Path.cwd() / 'stdin.txt', Path('.'), 'stdin', '.txt', '(standard input)')
+
+    def handle(self, item):
+        if item == STDIO:
+            return self.handle_stdin()
+        p = Path(item)
+        if p.is_dir():
+            return self.handle_directory(p.resolve())
+        if not p.exists():
+            raise FileNotFoundError(item)
+        return self.handle_file(p.resolve())
+
+    # ---------------------------------------------------------------- map file
+    def map_destination(self):
+        if self.args.map:
+            return Path(self.args.map)
+        if len(self.outputs) == 1:
+            dst = self.outputs[0]
+            return unique_path(dst.parent, dst.stem + '_PERSONAL-DATA-MAP', '.json')
+        folder = (self.output_dir if self.output_dir is not None
+                  else self.outputs[0].parent if self.outputs else Path.cwd())
+        return unique_path(folder, 'netblur_PERSONAL-DATA-MAP_' + datetime.now().strftime('%Y%m%d-%H%M%S'), '.json')
+
+    def write_map(self):
+        if self.privacy is None or not self.privacy.total() or self.args.no_map:
+            return
+        path = self.map_destination()
+        if path.exists() and not self.args.force:
+            raise ValueError('Map file already exists (use --force to overwrite): ' + str(path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8') as f:
+            json.dump(self.privacy.map_dict(self.sources), f, ensure_ascii=False, indent=2)
+        self.say()
+        self.say('Map of placeholders written (REAL personal data inside: keep it local, never share it):')
+        self.say('  ' + str(path))
 
 
-def process(path, personal=False):
-    src = Path(path).resolve()
-    with src.open('rb') as f:
-        raw_head = f.read(4)
-    if raw_head[:2] == b'PK' and zipfile.is_zipfile(src):
-        return process_zip(src, personal)
-    print('File:', src.name)
-    raw = src.read_bytes()
-    privacy = Privacy() if personal else None
-    data, changed, review, blocks, text = sanitize_bytes(raw, privacy)
-    dst = write_copy(src.parent, src.stem, src.suffix, data, changed, privacy)
-    report(dst, changed, review, blocks, text, privacy)
+def resolve_output(args, run):
+    """Decide whether -o names a directory or one file."""
+    if args.output is None or run.to_stdout:
+        return
+    out = Path(args.output)
+    many = len(args.input) > 1 or any(Path(i).is_dir() for i in args.input if i != STDIO)
+    looks_dir = out.is_dir() or args.output.endswith(('/', '\\'))
+    if many or looks_dir:
+        out.mkdir(parents=True, exist_ok=True)
+        run.output_dir = out.resolve()
+    else:
+        run.explicit_file = out
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog='netblur', description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('input', nargs='+', metavar='INPUT',
+                        help='configuration file, ZIP archive, directory, or - for standard input')
+    parser.add_argument('-o', '--output', metavar='PATH',
+                        help='output file (single input) or directory (several inputs); - for standard output')
+    parser.add_argument('-p', '--personal', action='store_true',
+                        help='level 2: also replace names, usernames, email addresses and phone numbers')
+    parser.add_argument('-m', '--map', metavar='FILE',
+                        help='where to write the JSON map of placeholders (default: next to the copies)')
+    parser.add_argument('--no-map', action='store_true', help='do not write the map file')
+    parser.add_argument('--strict', action='store_true',
+                        help='exit with status 2 when lines are flagged for review or a file had no secrets')
+    parser.add_argument('--force', action='store_true',
+                        help='allow overwriting the file named by -o or -m (never the originals)')
+    parser.add_argument('--version', action='version', version='netblur ' + VERSION)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    run = Run(args)
+    run.say('netblur', VERSION, '| level 2: secrets and personal data' if args.personal else '| level 1: secrets only')
+    if run.to_stdout and len(args.input) > 1:
+        run.say('Standard output works with a single input.')
+        return 1
+    try:
+        resolve_output(args, run)
+    except OSError as exc:
+        run.say('Cannot use the output path:', exc.strerror or exc)
+        return 1
+    for item in args.input:
+        run.say()
+        try:
+            run.handle(item)
+        except ValueError as exc:
+            run.failed += 1
+            run.say('Operation not completed:', exc)
+        except FileNotFoundError:
+            run.failed += 1
+            run.say('Operation not completed: not found:', item)
+        except Exception as exc:
+            run.failed += 1
+            # Never print contents or details that might contain secrets.
+            run.say('Operation not completed (' + type(exc).__name__ + ').')
+    try:
+        run.write_map()
+    except ValueError as exc:
+        run.failed += 1
+        run.say('Operation not completed:', exc)
+    run.say()
+    run.say('Done: %d file(s) written, %d skipped, %d error(s), %d line(s) to review, %d file(s) without secrets.'
+            % (run.written, run.skipped, run.failed, run.flagged, run.no_secrets))
+    run.say('Manual review always required: complete coverage is not guaranteed.')
+    run.say('Do not restore these copies onto devices.')
+    if run.failed:
+        return 1
+    if args.strict and (run.flagged or run.no_secrets):
+        return 2
     return 0
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--personal', action='store_true',
-                        help='Also replace names, usernames, emails and phone numbers')
-    parser.add_argument('input', nargs='+', help='Text configuration files')
-    args = parser.parse_args()
-    print('Mask passwords in configs, version', VERSION)
-    if args.personal:
-        print('Mode: secrets and personal data (names, usernames, emails, phone numbers)')
-    failed = 0
-    for item in args.input:
-        print()
-        try:
-            failed += process(item, args.personal)
-        except ValueError as exc:
-            failed += 1
-            print('Operation not completed:', exc)
-        except FileNotFoundError:
-            failed += 1
-            print('Operation not completed: file not found.')
-        except Exception as exc:
-            failed += 1
-            # Never print contents or details that might contain secrets.
-            print('Operation not completed (' + type(exc).__name__ + ').')
-    print()
-    print('Manual review always required: complete coverage is not guaranteed.')
-    print('Do not restore these copies onto devices.')
-    sys.exit(1 if failed else 0)
-
-
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -2,7 +2,7 @@
 setlocal
 
 if "%~1"=="" (
-    echo Right-click a configuration file, then Send to, Mask passwords and personal data.
+    echo Right-click a configuration file, then Send to, netblur ^(secrets and personal data^).
     echo You can also drag one or more files onto this file.
     echo Original files are never modified.
     pause
@@ -11,9 +11,9 @@ if "%~1"=="" (
 
 where py >nul 2>nul
 if %errorlevel%==0 (
-    py "%~dp0mask_passwords.py" --personal %*
+    py "%~dp0netblur.py" --personal %*
 ) else (
-    python "%~dp0mask_passwords.py" --personal %*
+    python "%~dp0netblur.py" --personal %*
 )
 
 echo.

@@ -1,5 +1,12 @@
 ### Changelog
 
+### 3.0
+- Renamed to netblur. Module `netblur.py`, command `netblur`, installable with pip
+- Output control: `-o` for a file or a directory, `-` for standard input and output, directories processed recursively with their structure mirrored
+- `--strict` exit code for scripts and CI, `--force` for the output named by `-o` or `-m`
+- One JSON map of placeholders shared by every file of a run (`-m`, `--no-map`)
+- Fortinet `set type password` no longer flagged for review
+
 ### 2.6
 - Personal data mode (`--personal`): names, usernames, email addresses and phone numbers replaced with consistent placeholders, with a local map file
 - `SEPARATEAUTHID` treated as a secret in 3CX configurations

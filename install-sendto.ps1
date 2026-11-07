@@ -8,7 +8,7 @@ $sendTo = [Environment]::GetFolderPath('SendTo')
 $shell = New-Object -ComObject WScript.Shell
 $entries = @(
     @{ Name = 'Mask passwords in configs'; Target = 'run.bat'; Icon = 77 },
-    @{ Name = 'Mask passwords and personal data'; Target = 'run_personal.bat'; Icon = 78 }
+    @{ Name = 'Mask passwords and personal data'; Target = 'run_personal.bat'; Icon = 74 }
 )
 foreach ($e in $entries) {
     $link = $shell.CreateShortcut((Join-Path $sendTo ($e.Name + '.lnk')))

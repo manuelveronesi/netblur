@@ -1,0 +1,11 @@
+{
+  "key": "mgmt",
+  "x_ssh_password": "LEAKssh",
+  "x_passphrase": "LEAKwlan",
+  "x_iapp_key": "LEAKiapp",
+  "x_shadow": "$6$LEAKshadow",
+  "x_password_required": false,
+  "name": "WLAN",
+  "radius": {"x_secret": "LEAKrad", "ip": "10.0.0.5"},
+  "description": "normal"
+}

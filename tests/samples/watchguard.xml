@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<profile>
+ <system-parameters><device-conf><system-name>WG</system-name></device-conf></system-parameters>
+ <user><name>admin</name><password>LEAKwg1</password></user>
+ <ike-policy><pre-shared-key>LEAKwgpsk</pre-shared-key><psk-type>ascii</psk-type></ike-policy>
+ <radius-server shared-secret="LEAKrad" ip="10.0.0.5"/>
+ <snmp><community>LEAKcomm</community></snmp>
+ <bovpn><shared-key>
+LEAKmultiline
+ </shared-key></bovpn>
+ <passphrase>LEAKwifi</passphrase>
+</profile>

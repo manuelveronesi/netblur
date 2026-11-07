@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<pfsense>
+ <system><user><name>admin</name><bcrypt-hash>$2y$10$LEAKbcrypt</bcrypt-hash></user></system>
+ <ipsec><phase1><pre-shared-key>LEAKpf</pre-shared-key></phase1></ipsec>
+ <cert><crt>PUBLICOK</crt><prv>LEAKprvbase64</prv></cert>
+ <openvpn><openvpn-server><tls>LEAKtls</tls><shared_key>LEAKsk</shared_key></openvpn-server></openvpn>
+ <ldap_bindpw>LEAKbind</ldap_bindpw>
+</pfsense>

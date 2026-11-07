@@ -1,0 +1,14 @@
+# Never commit tool output: copies may still contain data, and the maps contain real personal data.
+*_SANITIZED*
+*_ANONYMIZED*
+*_NO-SECRETS-FOUND*
+*PERSONAL-DATA-MAP*
+
+# Never commit real configurations or backups by mistake.
+*.zip
+*.unf
+*.fxi
+*.bak
+
+__pycache__/
+*.pyc

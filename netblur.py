@@ -26,7 +26,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '3.0'
+VERSION = '3.1'
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s]+')
 
@@ -499,6 +499,68 @@ NAME_STOP = {'none', 'null', 'true', 'false', 'default', 'admin', 'user', 'test'
              'redacted'}
 WORD = re.compile(r"[A-Za-z0-9\u00c0-\u024f][\w.'\u00c0-\u024f-]*")
 
+# Identities (level 2): hostnames, domains, IP and MAC addresses, user-supplied words.
+HOST_CMD = re.compile(r'(?i)^\s*(?:set\s+)?(?:hostname|host-name|sysname|switchname|system-name|device-name|'
+                      r'set system host-name)\s+("[^"]+"|\S+)\s*;?\s*$')
+HOST_TAGS = re.compile(r'<(hostname|HostName|externalFqdn|systemName|system-name|sysname|device-name)>([^<]+)</\1>', re.I)
+HOST_KV = re.compile(r'(?i)(?:^|\s)(?:hostname|host-name|identity|sysname|system\.name|resolv\.host\.1\.name)=("[^"]+"|\S+)')
+DOMAIN_CMD = re.compile(r'(?i)^\s*(?:set\s+|ip\s+|ipv6\s+|dns\s+)?(?:domain[- ]name|domain|domainname|'
+                        r'ip domain list|ip domain-list|search-domain|dns-suffix)\s+("[^"]+"|[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*;?\s*$')
+DOMAIN_TAGS = re.compile(r'<(domain|domainName|dnsDomain|searchDomain|ldapDomain)>([^<]+)</\1>', re.I)
+IPV4 = re.compile(r'(?<![\w.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\w.])')
+IPV6 = re.compile(r'(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){2,7}(?::?[0-9A-Fa-f]{1,4}){1,6}(?![\w:])|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){1,7}:(?![\w:])')
+MAC = re.compile(r'(?<![\w:.-])(?:[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4})(?![\w:.-])')
+VERSION_CONTEXT = re.compile(r'(?i)(?<![a-z])(?:version|build|release|firmware|fw|ver|v)[\s=:"\'-]*$')
+MAC_SHAPED = re.compile(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}')
+DOC_RANGES = [('192.0.2.', 1, 254), ('198.51.100.', 1, 254), ('203.0.113.', 1, 254)]
+# Well-known public resolvers and similar: they say nothing about the customer, so they stay readable.
+WELL_KNOWN_IPS = {'8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1', '9.9.9.9', '149.112.112.112',
+                  '208.67.222.222', '208.67.220.220', '4.2.2.1', '4.2.2.2'}
+GENERIC_HOSTS = {'router', 'switch', 'firewall', 'fw', 'gw', 'gateway', 'core', 'localhost', 'default', 'none',
+                 'ubnt', 'mikrotik', 'routeros', 'fortigate', 'fortiweb', 'zywall', 'usg', 'atp', 'pbx', '3cx'}
+GENERIC_DOMAINS = {'local', 'lan', 'localdomain', 'home', 'internal', 'example.com', 'example.net', 'example.org'}
+
+
+def classify_ipv4(ip):
+    """'keep' for addresses that identify nothing, 'private' for RFC 1918, 'public' otherwise."""
+    if ip in WELL_KNOWN_IPS:
+        return 'keep'
+    a, b, c, d = (int(x) for x in ip.split('.'))
+    if a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168):
+        return 'private'
+    if a in (0, 127) or a >= 224 or (a == 169 and b == 254) or (a == 100 and 64 <= b <= 127):
+        return 'keep'
+    if (a, b, c) in ((192, 0, 2), (198, 51, 100), (203, 0, 113)) or (a == 198 and b in (18, 19)):
+        return 'keep'  # documentation and benchmarking ranges: already anonymous
+    # Netmasks (1...10...0) and wildcard masks (0...01...1) identify nothing.
+    bits = (a << 24) | (b << 16) | (c << 8) | d
+    inv = bits ^ 0xFFFFFFFF
+    if (bits & (bits + 1)) == 0 or (inv & (inv + 1)) == 0:
+        return 'keep'
+    return 'public'
+
+
+def classify_ipv6(ip):
+    low = ip.lower()
+    if low in ('::', '::1') or low.startswith(('fe80:', 'fe9', 'fea', 'feb', 'fc', 'fd', 'ff', '2001:db8:', '::ffff:')):
+        return 'keep'
+    return 'public'
+
+
+def mac_placeholder(tok):
+    n = int(tok.split('_')[1])
+    fake = '02%010x' % n
+    return ':'.join(fake[i:i + 2] for i in range(0, 12, 2))
+
+
+def classify_mac(mac):
+    h = re.sub(r'[^0-9A-Fa-f]', '', mac).lower()
+    if h in ('000000000000', 'ffffffffffff') or h.startswith(('01005e', '333300', '00005e0001', '00000c07ac', '0180c2')):
+        return 'keep'
+    if int(h[1], 16) & 2:
+        return 'keep'  # locally administered: already synthetic (also our own output)
+    return 'public'
+
 
 def looks_like_phone(raw):
     d = re.sub(r'\D', '', raw)
@@ -519,9 +581,21 @@ def looks_like_phone(raw):
 class Privacy:
     """Consistent placeholders for personal data within one output file."""
 
-    def __init__(self):
-        self.maps = {'NAME': {}, 'USER': {}, 'EMAIL': {}, 'PHONE': {}}
+    KINDS = ('NAME', 'USER', 'EMAIL', 'PHONE', 'HOST', 'DOMAIN', 'IP', 'IP6', 'MAC', 'WORD')
+
+    def __init__(self, words=(), ip_mode='public', macs=True):
+        self.maps = {k: {} for k in self.KINDS}
         self.keywords = set()
+        self.ip_mode = ip_mode    # 'public' (default), 'all', or 'keep'
+        self.macs = macs
+        self.words = []
+        for w in words:
+            w = w.strip()
+            if len(w) >= 3:
+                self.words.append(w)
+                self.token('WORD', w.lower())
+        self.ip_count = 0
+        self.host_case = {}
 
     def total(self):
         return sum(len(m) for m in self.maps.values())
@@ -529,8 +603,43 @@ class Privacy:
     def token(self, kind, value):
         m = self.maps[kind]
         if value not in m:
-            m[value] = '%s_%d' % (kind, len(m) + 1)
+            if kind == 'IP':
+                m[value] = self.next_ipv4()
+            elif kind == 'IP6':
+                m[value] = '2001:db8::%x' % (len(m) + 1)
+            elif kind == 'DOMAIN':
+                m[value] = 'example-%d.net' % (len(m) + 1)
+            else:
+                m[value] = '%s_%d' % (kind, len(m) + 1)
         return m[value]
+
+    def next_ipv4(self):
+        """Documentation ranges first (RFC 5737), then the benchmarking range 198.18.0.0/15 (RFC 2544)."""
+        self.ip_count += 1
+        n = self.ip_count
+        for prefix, lo, hi in DOC_RANGES:
+            if n <= hi - lo + 1:
+                return '%s%d' % (prefix, lo + n - 1)
+            n -= hi - lo + 1
+        if n > 131070:
+            raise ValueError('Too many distinct public IP addresses to anonymize consistently.')
+        n += 0  # 198.18.0.1 onwards
+        return '198.%d.%d.%d' % (18 + (n >> 16), (n >> 8) & 255, n & 255)
+
+    def add_host(self, value):
+        v = value.strip().strip('"\';')
+        if '.' in v and not v.replace('.', '').isdigit():
+            parts = v.split('.', 1)
+            self.add_domain(parts[1])
+            v = parts[0]
+        if len(v) >= 3 and v.lower() not in GENERIC_HOSTS and not IPV4.fullmatch(v) and v.lower() != 'redacted':
+            self.token('HOST', v.lower())
+            self.host_case.setdefault(v.lower(), v)
+
+    def add_domain(self, value):
+        v = value.strip().strip('"\';').lower().rstrip('.')
+        if len(v) >= 4 and '.' in v and v not in GENERIC_DOMAINS and not IPV4.fullmatch(v):
+            self.token('DOMAIN', v)
 
     def learn_keywords(self, text):
         # Words used as configuration keywords are never treated as personal names.
@@ -582,6 +691,22 @@ class Privacy:
             m = USER_CMD.match(line)
             if m:
                 self.add_user(m.group(1))
+            m = HOST_CMD.match(line)
+            if m:
+                self.add_host(m.group(1))
+            for m in HOST_TAGS.finditer(line):
+                self.add_host(m.group(2))
+            if ros == '/system identity':
+                for m in re.finditer(r'(?:^|\s)name=("[^"]+"|\S+)', line):
+                    self.add_host(m.group(1))
+            elif line.lstrip().startswith(('hostname=', 'system.name=', 'resolv.host')):
+                for m in HOST_KV.finditer(line):
+                    self.add_host(m.group(1))
+            m = DOMAIN_CMD.match(line)
+            if m:
+                self.add_domain(m.group(1))
+            for m in DOMAIN_TAGS.finditer(line):
+                self.add_domain(m.group(2))
             if forti and forti[-1] in ('user local', 'system admin'):
                 e = re.match(r'^\s*edit\s+("[^"]+"|\S+)', line)
                 if e:
@@ -591,8 +716,8 @@ class Privacy:
                     self.add_user(kv.group(1))
 
     def apply(self, text):
-        """Replace emails, phone numbers and the collected names everywhere in the text."""
-        counts = {'NAME': 0, 'USER': 0, 'EMAIL': 0, 'PHONE': 0}
+        """Replace emails, phone numbers, identities and the collected names everywhere in the text."""
+        counts = {k: 0 for k in self.KINDS}
 
         def email(m):
             counts['EMAIL'] += 1
@@ -614,6 +739,9 @@ class Privacy:
         text = EMAIL.sub(email, text)
         text = PHONE_FIELDS.sub(field, text)
         text = PHONE.sub(phone, text)
+        text = self.apply_hosts(text, counts)
+        text = self.apply_words(text, counts)
+        text = self.apply_addresses(text, counts)
         names, users = self.maps['NAME'], self.maps['USER']
 
         def word(m):
@@ -638,6 +766,75 @@ class Privacy:
             text = ''.join(parts)
         return text, counts
 
+    def apply_hosts(self, text, counts):
+        """Hostnames (as whole tokens, also inside FQDNs) and domains (as suffixes or alone)."""
+        hosts = sorted(self.maps['HOST'], key=len, reverse=True)
+        if hosts:
+            rx = re.compile(r'(?<![\w-])(' + '|'.join(re.escape(h) for h in hosts) + r')(?![\w-])', re.I)
+
+            def host(m):
+                counts['HOST'] += 1
+                return self.maps['HOST'][m.group(1).lower()]
+            text = rx.sub(host, text)
+        domains = sorted(self.maps['DOMAIN'], key=len, reverse=True)
+        if domains:
+            rx = re.compile(r'(?<![\w-])(' + '|'.join(re.escape(d) for d in domains) + r')(?![\w-])', re.I)
+
+            def domain(m):
+                counts['DOMAIN'] += 1
+                return self.maps['DOMAIN'][m.group(1).lower()]
+            text = rx.sub(domain, text)
+        return text
+
+    def apply_words(self, text, counts):
+        """User-supplied sensitive words, anywhere they appear, even inside longer tokens."""
+        if not self.words:
+            return text
+        rx = re.compile('|'.join(re.escape(w) for w in sorted(self.words, key=len, reverse=True)), re.I)
+
+        def word(m):
+            counts['WORD'] += 1
+            return self.maps['WORD'][m.group().lower()]
+        return rx.sub(word, text)
+
+    def apply_addresses(self, text, counts):
+        if self.ip_mode != 'keep':
+            def v4(m):
+                ip = m.group()
+                kind = classify_ipv4(ip)
+                if kind == 'keep' or (kind == 'private' and self.ip_mode != 'all'):
+                    return ip
+                if VERSION_CONTEXT.search(m.string[max(0, m.start() - 20):m.start()]):
+                    return ip  # a four-part version number, not an address
+                counts['IP'] += 1
+                return self.token('IP', ip)
+
+            def v6(m):
+                ip = m.group()
+                if classify_ipv6(ip) == 'keep' or ip.count(':') < 2 or MAC_SHAPED.fullmatch(ip):
+                    return ip
+                counts['IP6'] += 1
+                return self.token('IP6', ip.lower())
+            text = IPV4.sub(v4, text)
+            text = IPV6.sub(v6, text)
+        if self.macs:
+            def mac(m):
+                raw = m.group()
+                if classify_mac(raw) == 'keep':
+                    return raw
+                counts['MAC'] += 1
+                h = re.sub(r'[^0-9A-Fa-f]', '', raw).lower()
+                tok = self.token('MAC', ':'.join(h[i:i + 2] for i in range(0, 12, 2)))
+                n = int(tok.split('_')[1])
+                fake = '02%010x' % n
+                if '.' in raw:
+                    return '%s.%s.%s' % (fake[0:4], fake[4:8], fake[8:12])
+                sep = ':' if ':' in raw else '-'
+                out = sep.join(fake[i:i + 2] for i in range(0, 12, 2))
+                return out.upper() if raw.upper() == raw and any(c.isalpha() for c in raw) else out
+            text = MAC.sub(mac, text)
+        return text
+
     def map_dict(self, sources):
         """Placeholder -> real value, grouped by kind, ready to be written as JSON."""
         out = {
@@ -646,8 +843,15 @@ class Privacy:
             'created': datetime.now().isoformat(timespec='seconds'),
             'sources': list(sources),
         }
-        for kind, key in (('NAME', 'names'), ('USER', 'users'), ('EMAIL', 'emails'), ('PHONE', 'phones')):
-            out[key] = {tok: value for value, tok in self.maps[kind].items()}
+        keys = {'NAME': 'names', 'USER': 'users', 'EMAIL': 'emails', 'PHONE': 'phones', 'HOST': 'hosts',
+                'DOMAIN': 'domains', 'IP': 'ips', 'IP6': 'ipv6', 'MAC': 'macs', 'WORD': 'words'}
+        for kind in self.KINDS:
+            table = self.maps[kind]
+            if kind == 'MAC':
+                table = {k: mac_placeholder(v) for k, v in table.items()}
+            if kind == 'HOST':
+                table = {self.host_case.get(k, k): v for k, v in table.items()}
+            out[keys[kind]] = {tok: value for value, tok in table.items()}
         return out
 
 
@@ -753,7 +957,13 @@ class Run:
 
     def __init__(self, args):
         self.args = args
-        self.privacy = Privacy() if args.personal else None
+        self.privacy = None
+        if args.personal:
+            words = list(args.words or [])
+            if args.words_file:
+                words += [w for w in Path(args.words_file).read_text(encoding='utf-8').splitlines()]
+            ip_mode = 'keep' if args.keep_ips else 'all' if args.all_ips else 'public'
+            self.privacy = Privacy(words=words, ip_mode=ip_mode, macs=not args.keep_macs)
         self.to_stdout = args.output == STDIO
         self.log = sys.stderr if self.to_stdout else sys.stdout
         self.failed = self.skipped = self.flagged = self.no_secrets = self.written = 0
@@ -937,7 +1147,14 @@ class Run:
         return unique_path(folder, 'netblur_PERSONAL-DATA-MAP_' + datetime.now().strftime('%Y%m%d-%H%M%S'), '.json')
 
     def write_map(self):
-        if self.privacy is None or not self.privacy.total() or self.args.no_map:
+        if self.privacy is None or not self.privacy.total():
+            return
+        m = self.privacy.maps
+        self.say()
+        self.say('Identities replaced in this run: %d names, %d usernames, %d emails, %d phone numbers, %d hosts, '
+                 '%d domains, %d IPv4, %d IPv6, %d MACs, %d words'
+                 % tuple(len(m[k]) for k in Privacy.KINDS))
+        if self.args.no_map:
             return
         path = self.map_destination()
         if path.exists() and not self.args.force:
@@ -945,7 +1162,6 @@ class Run:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('w', encoding='utf-8') as f:
             json.dump(self.privacy.map_dict(self.sources), f, ensure_ascii=False, indent=2)
-        self.say()
         self.say('Map of placeholders written (REAL personal data inside: keep it local, never share it):')
         self.say('  ' + str(path))
 
@@ -956,7 +1172,8 @@ def resolve_output(args, run):
         return
     out = Path(args.output)
     many = len(args.input) > 1 or any(Path(i).is_dir() for i in args.input if i != STDIO)
-    looks_dir = out.is_dir() or args.output.endswith(('/', '\\'))
+    # A path without an extension is taken as a directory: configuration copies always keep theirs.
+    looks_dir = out.is_dir() or args.output.endswith(('/', '\\')) or not out.suffix
     if many or looks_dir:
         out.mkdir(parents=True, exist_ok=True)
         run.output_dir = out.resolve()
@@ -970,12 +1187,22 @@ def build_parser():
     parser.add_argument('input', nargs='+', metavar='INPUT',
                         help='configuration file, ZIP archive, directory, or - for standard input')
     parser.add_argument('-o', '--output', metavar='PATH',
-                        help='output file (single input) or directory (several inputs); - for standard output')
+                        help='output file (single input, with an extension) or directory; - for standard output')
     parser.add_argument('-p', '--personal', action='store_true',
                         help='level 2: also replace names, usernames, email addresses and phone numbers')
     parser.add_argument('-m', '--map', metavar='FILE',
                         help='where to write the JSON map of placeholders (default: next to the copies)')
     parser.add_argument('--no-map', action='store_true', help='do not write the map file')
+    parser.add_argument('-w', '--words', metavar='WORD', action='append',
+                        help='level 2: sensitive word to replace wherever it appears, even inside other words '
+                             '(repeat the option or separate words with commas)')
+    parser.add_argument('--words-file', metavar='FILE', help='level 2: file with one sensitive word per line')
+    parser.add_argument('--all-ips', action='store_true',
+                        help='level 2: also replace private IP addresses (default: public ones only)')
+    parser.add_argument('--keep-ips', action='store_true', help='level 2: keep every IP address as it is')
+    parser.add_argument('--keep-macs', action='store_true', help='level 2: keep MAC addresses as they are')
+    parser.add_argument('--restore', action='store_true',
+                        help='put the real values back into a text (for example an AI answer) using the map given with -m')
     parser.add_argument('--strict', action='store_true',
                         help='exit with status 2 when lines are flagged for review or a file had no secrets')
     parser.add_argument('--force', action='store_true',
@@ -984,8 +1211,87 @@ def build_parser():
     return parser
 
 
+def restore_text(text, mapping):
+    """Replace every placeholder found in text with its real value."""
+    table = {}
+    for key in ('names', 'users', 'emails', 'phones', 'hosts', 'domains', 'ips', 'ipv6', 'words'):
+        table.update(mapping.get(key, {}))
+    for tok, real in mapping.get('macs', {}).items():
+        h = tok.replace(':', '')
+        table[tok] = real
+        table[tok.upper()] = real
+        table['-'.join(h[i:i + 2] for i in range(0, 12, 2))] = real
+        table['%s.%s.%s' % (h[0:4], h[4:8], h[8:12])] = real
+    if not table:
+        return text, 0
+    rx = re.compile(r'(?<![\w.:-])(' + '|'.join(re.escape(t) for t in sorted(table, key=len, reverse=True)) + r')(?![\w:-])')
+    count = [0]
+
+    def put(m):
+        count[0] += 1
+        return table[m.group(1)]
+    return rx.sub(put, text), count[0]
+
+
+def restore_main(args):
+    if not args.map:
+        print('--restore needs the map file: -m FILE', file=sys.stderr)
+        return 1
+    try:
+        mapping = json.loads(Path(args.map).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        print('Cannot read the map file:', getattr(exc, 'strerror', None) or exc, file=sys.stderr)
+        return 1
+    to_stdout = args.output == STDIO
+    log = sys.stderr if to_stdout else sys.stdout
+    failed = 0
+    for item in args.input:
+        try:
+            if item == STDIO:
+                raw, src = sys.stdin.buffer.read(), None
+            else:
+                src = Path(item)
+                raw = src.read_bytes()
+            text, enc = decode(raw)
+            out, n = restore_text(text, mapping)
+            if to_stdout:
+                sys.stdout.buffer.write(out.encode(enc))
+                sys.stdout.buffer.flush()
+                dst = '(standard output)'
+            else:
+                if args.output and len(args.input) == 1:
+                    dst = Path(args.output)
+                    if dst.exists() and not args.force:
+                        raise ValueError('Output file already exists (use --force to overwrite): ' + dst.name)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_bytes(out.encode(enc))
+                else:
+                    folder = Path(args.output) if args.output else (src.parent if src else Path.cwd())
+                    folder.mkdir(parents=True, exist_ok=True)
+                    dst = unique_path(folder, (src.stem if src else 'stdin') + '_RESTORED', src.suffix if src else '.txt')
+                    with dst.open('xb') as f:
+                        f.write(out.encode(enc))
+                dst = dst.name
+            print('Restored %d placeholder(s) in %s -> %s' % (n, item, dst), file=log)
+        except ValueError as exc:
+            failed += 1
+            print('Operation not completed:', exc, file=log)
+        except FileNotFoundError:
+            failed += 1
+            print('Operation not completed: not found:', item, file=log)
+        except Exception as exc:
+            failed += 1
+            print('Operation not completed (' + type(exc).__name__ + ').', file=log)
+    print('The restored text contains REAL data: keep it local.', file=log)
+    return 1 if failed else 0
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.words:
+        args.words = [w for item in args.words for w in item.split(',')]
+    if args.restore:
+        return restore_main(args)
     run = Run(args)
     run.say('netblur', VERSION, '| level 2: secrets and personal data' if args.personal else '| level 1: secrets only')
     if run.to_stdout and len(args.input) > 1:
@@ -1006,15 +1312,18 @@ def main(argv=None):
         except FileNotFoundError:
             run.failed += 1
             run.say('Operation not completed: not found:', item)
+        except OSError as exc:
+            run.failed += 1
+            run.say('Operation not completed:', exc.strerror or type(exc).__name__)
         except Exception as exc:
             run.failed += 1
             # Never print contents or details that might contain secrets.
             run.say('Operation not completed (' + type(exc).__name__ + ').')
     try:
         run.write_map()
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         run.failed += 1
-        run.say('Operation not completed:', exc)
+        run.say('Map not written:', getattr(exc, 'strerror', None) or exc)
     run.say()
     run.say('Done: %d file(s) written, %d skipped, %d error(s), %d line(s) to review, %d file(s) without secrets.'
             % (run.written, run.skipped, run.failed, run.flagged, run.no_secrets))

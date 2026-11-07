@@ -1,6 +1,6 @@
 ### netblur
 
-Mask passwords, keys and other secrets in network device configurations before you hand them to an AI for analysis. Optionally, blur the identity too: names, usernames, email addresses and phone numbers.
+Mask passwords, keys and other secrets in network device configurations before you hand them to an AI for analysis. Optionally, blur the identity too: names, usernames, email addresses, phone numbers, hostnames, domains, public IP addresses, MAC addresses and any word you choose.
 
 It runs locally, needs nothing but Python and never connects to the Internet. Originals are never modified: you get a sanitized copy next to them.
 
@@ -35,9 +35,13 @@ Public certificates (`BEGIN CERTIFICATE`) are left untouched.
 | Level | Command | Copy suffix | What is replaced |
 | --- | --- | --- | --- |
 | 1, secrets only | `netblur FILE` | `_SANITIZED` | passwords, keys, communities, PINs, tokens, hashes |
-| 2, secrets and personal data | `netblur --personal FILE` | `_ANONYMIZED` | the above, plus names, usernames, email addresses and phone numbers |
+| 2, secrets and identity | `netblur --personal FILE` | `_ANONYMIZED` | the above, plus names, usernames, email addresses, phone numbers, hostnames, domains, public IP addresses, MAC addresses and the words you pass with `-w` |
 
-At level 2 the values are replaced with consistent placeholders such as `NAME_1`, `USER_1`, `EMAIL_1` and `PHONE_1`. The same value always gets the same placeholder, across every file of the run, so the AI can still follow forwarding rules, group memberships and routing without knowing who is involved. A JSON map links each placeholder to the real value, so you can read the AI's answers. That file contains the real data: keep it local and never share it.
+At level 2 the values are replaced with consistent placeholders: `NAME_1`, `USER_1`, `EMAIL_1`, `PHONE_1`, `HOST_1`, `example-1.net`, `WORD_1`, public addresses from the documentation ranges (`192.0.2.1`, `198.51.100.1`, `203.0.113.1`, then `198.18.0.0/15`), IPv6 under `2001:db8::/32` and locally administered MACs (`02:00:00:00:00:01`). The same value always gets the same placeholder, across every file of the run, so the AI can still follow forwarding rules, BGP peers, group memberships and routing without knowing who or where. Private addresses, netmasks, wildcard masks, multicast and well-known public resolvers stay readable, and `--all-ips`, `--keep-ips` and `--keep-macs` change that.
+
+`-w` takes the words that identify the customer (company name, city, project) and replaces them wherever they appear, even inside hostnames and descriptions: `-w Acme,Milano` or `--words-file words.txt`.
+
+A JSON map links each placeholder to the real value. `netblur --restore answer.txt -m map.json` puts the real values back into the AI's answer, so you can act on it. Both files contain real data: keep them local and never share them.
 
 When nothing is found to mask, the copy gets the `_NO-SECRETS-FOUND` suffix and a warning is shown, because zero secrets can also mean a syntax the tool doesn't know. Existing files are never overwritten: a new copy with date and time in its name is created instead.
 
@@ -59,16 +63,20 @@ netblur --personal 3CXScheduledBackup.zip
 netblur config1.conf config2.cfg backup.zip
 netblur backups/ -o clean/
 cat running-config.txt | netblur - -o - > clean.txt
-netblur --personal site-a/ site-b/ -o clean/ -m clean/map.json
+netblur --personal site-a/ site-b/ -o clean/ -m clean/map.json -w Acme,Milano
+netblur --restore ai-answer.txt -m clean/map.json
 netblur config.conf -o out/ --strict
 ```
 
 | Option | Effect |
 | --- | --- |
-| `-o PATH` | Output file (single input) or directory (several inputs or a directory). `-` writes to standard output and sends the report to standard error |
-| `-p`, `--personal` | Level 2: also replace names, usernames, email addresses and phone numbers |
+| `-o PATH` | Output file (single input, with an extension) or directory (a path without extension, with a trailing slash, or with several inputs). `-` writes to standard output and sends the report to standard error |
+| `-p`, `--personal` | Level 2: also replace names, usernames, emails, phones, hostnames, domains, public IPs, MACs |
+| `-w WORD`, `--words-file FILE` | Level 2: sensitive words to replace wherever they appear (repeat `-w` or separate with commas) |
+| `--all-ips`, `--keep-ips`, `--keep-macs` | Level 2: replace private addresses too, or keep every IP or MAC as it is |
 | `-m FILE` | Where to write the JSON map of placeholders (default: next to the copies) |
 | `--no-map` | Do not write the map file |
+| `--restore` | Put the real values back into a text using the map given with `-m` (output: `_RESTORED` copy, or `-o`) |
 | `--strict` | Exit with status 2 when lines are flagged for review or a file had no secrets (useful in scripts and CI) |
 | `--force` | Allow overwriting the file named by `-o` or `-m`, never the originals |
 
@@ -92,7 +100,7 @@ Read these before relying on the output.
 
 - This is a conservative, pattern-based tool, not a parser. It recognises secrets from the shape of each line, and new firmware or unusual syntax can slip through. **Always review the copy before sharing it**, starting from the lines flagged in the report.
 - When in doubt it masks, so some harmless values may be masked too.
-- At level 2, names are recognised in the fields that hold them (`FirstName`, `username`, SNMP contact and similar). A name written only inside free text can remain visible. Hostnames, domains and IP addresses are not replaced yet.
+- At level 2, names are recognised in the fields that hold them (`FirstName`, `username`, SNMP contact and similar), hostnames and domains in the commands that set them. A name written only inside free text can remain visible: pass it with `-w`. Replaced addresses keep no subnet relationship with each other, and interface descriptions are kept (scrubbed of what the tool recognises) rather than blanked.
 - Fully binary or encrypted backups (for example UniFi `.unf`, encrypted WatchGuard backups, many router `.cfg` and `.bin` files) are rejected: export the configuration as text. Password-protected ZIP files must be extracted first.
 - The sanitized copy cannot be restored onto a device.
 

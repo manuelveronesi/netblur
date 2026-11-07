@@ -1,5 +1,12 @@
 ### Changelog
 
+### 3.1
+- Level 2 now blurs the identity of the network too: hostnames (`HOST_n`), domains (`example-n.net`, also as FQDN suffixes), public IPv4 and IPv6 addresses (documentation ranges, consistent per run), MAC addresses (locally administered, format preserved) and user-supplied words (`-w`, `--words-file`)
+- `--all-ips`, `--keep-ips`, `--keep-macs`
+- `--restore` puts the real values back into a text using the map
+- Private addresses, masks, multicast, four-part version numbers and well-known public resolvers are left as they are
+- A path given to `-o` without an extension is treated as a directory
+
 ### 3.0
 - Renamed to netblur. Module `netblur.py`, command `netblur`, installable with pip
 - Output control: `-o` for a file or a directory, `-` for standard input and output, directories processed recursively with their structure mirrored

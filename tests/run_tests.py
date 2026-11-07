@@ -214,10 +214,53 @@ def test_cli(tmp):
     check('cli: --version', code == 0 and out.strip().startswith('netblur '))
 
 
+def test_identities(tmp):
+    work = tmp / 'identities'
+    work.mkdir()
+    shutil.copy(SAMPLES / 'identity.conf', work)
+    code, out = run(['-p', 'identity.conf', '-w', 'Leakcorp,Milano', '-o', 'out/', '-m', 'out/map.json'], work)
+    copy = work / 'out' / 'identity_ANONYMIZED.conf'
+    check('identities: copy created', code == 0 and copy.exists(), out[-400:])
+    if not copy.exists():
+        return
+    body = text(copy)
+    for real in ('ACMEHOST', 'leakcorp', 'Leakcorp', 'Milano', '82.121.34', '2a00:1450', '0011.22aa', '00:11:22', 'noc@'):
+        check('identities: "%s" removed' % real, real not in body)
+    check('identities: hostname pseudonymised', 'hostname HOST_1' in body)
+    check('identities: domain pseudonymised also inside FQDNs', 'ntp server ntp1.example-1.net' in body)
+    check('identities: same public IP gets the same alias', body.count('192.0.2.1') == 2 and 'neighbor 192.0.2.2 remote-as' in body)
+    check('identities: private IPs, masks and wildcards kept',
+          '192.168.10.1 255.255.255.0' in body and '10.0.0.0 0.0.0.255' in body)
+    check('identities: MAC format preserved', 'mac-address 0200.0000.0001' in body and '02:00:00:00:00:02 ARPA' in body)
+    check('identities: four-part version number kept', 'firmware version 7.2.8.1' in body)
+    check('identities: AS numbers and structure kept', 'remote-as 3215' in body and 'router bgp 65001' in body)
+    m = json.loads(text(work / 'out' / 'map.json'))
+    check('identities: map holds every kind', m['hosts'].get('HOST_1') == 'ACMEHOST-CORE-01'
+          and m['domains'].get('example-1.net') == 'leakcorp.example' and m['ips'].get('192.0.2.1') == '82.121.34.5'
+          and '2001:db8::1' in m['ipv6'] and '02:00:00:00:00:01' in m['macs'] and m['words'].get('WORD_1') == 'leakcorp')
+    # --keep-ips / --all-ips / --keep-macs
+    code, out = run(['-p', 'identity.conf', '-o', 'keep', '--keep-ips', '--keep-macs', '--no-map'], work)
+    kept = text(work / 'keep' / 'identity_ANONYMIZED.conf')
+    check('identities: --keep-ips and --keep-macs honoured', '82.121.34.5' in kept and '0011.22aa.bbcc' in kept)
+    code, out = run(['-p', 'identity.conf', '-o', 'all', '--all-ips', '--no-map'], work)
+    every = text(work / 'all' / 'identity_ANONYMIZED.conf')
+    check('identities: --all-ips replaces private addresses too', '192.168.10.1' not in every and '255.255.255.0' in every)
+    # restore round trip, including placeholders in other MAC notations
+    answer = work / 'answer.txt'
+    answer.write_text('HOST_1 in example-1.net peers with 192.0.2.2 via 0200.0000.0001; contact EMAIL_1 about WORD_1.\n')
+    code, out = run(['--restore', 'answer.txt', '-m', 'out/map.json'], work)
+    restored = text(work / 'answer_RESTORED.txt') if (work / 'answer_RESTORED.txt').exists() else ''
+    check('restore: placeholders replaced by real values', code == 0 and restored.startswith('ACMEHOST-CORE-01 in leakcorp.example peers with 82.121.34.6 via 00:11:22:aa:bb:cc;')
+          and 'noc@leakcorp.example' in restored and 'leakcorp.' in restored, restored + out[-200:])
+    code, out = run(['--restore', 'answer.txt'], work)
+    check('restore: refuses to run without a map', code == 1)
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='netblur-tests-'))
     try:
-        for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_cli):
+        for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_cli,
+                     test_identities):
             print('--- ' + test.__name__)
             test(tmp)
     finally:

@@ -1,0 +1,61 @@
+{
+    "module": "core",
+    "version": null,
+    "pbx_version": null,
+    "configs": {
+        "Ampusers": [
+            {
+                "username": "admin",
+                "password_sha1": "LEAK5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8",
+                "extension_low": "",
+                "sections": ["*"]
+            }
+        ],
+        "Users": [
+            {
+                "extension": "1001",
+                "password": "",
+                "name": "John Smith",
+                "voicemail": "default"
+            }
+        ],
+        "Devices": [
+            {
+                "id": "1001",
+                "tech": "pjsip",
+                "dial": "PJSIP/1001",
+                "devicetype": "fixed",
+                "user": "1001",
+                "description": "John Smith"
+            }
+        ],
+        "Trunks": {
+            "techTables": {
+                "pjsip": [
+                    {
+                        "id": "1",
+                        "keyword": "secret",
+                        "data": "LEAKtrunksecret",
+                        "flags": 0
+                    },
+                    {
+                        "id": "1",
+                        "keyword": "sip_server",
+                        "data": "sip.provider.example",
+                        "flags": 0
+                    },
+                    {
+                        "id": "1",
+                        "keyword": "username",
+                        "data": "trunkaccount",
+                        "flags": 0
+                    }
+                ]
+            }
+        },
+        "settings": {"AMPMGRPASS": "LEAKjsonmgr", "FPBX_ARI_PASSWORD": "LEAKari", "SIPSECRETSIZE": "32", "AMPDBHOST": "localhost"},
+        "compact": [{"id": "2", "keyword": "secret", "data": "LEAKcompact", "flags": 0}, {"id": "2", "keyword": "context", "data": "from-trunk", "flags": 0}]
+    },
+    "dependencies": [],
+    "garbage": []
+}

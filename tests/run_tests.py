@@ -4,12 +4,16 @@
 Every secret in the sample files contains the word LEAK, so a sanitized copy
 passes when that word no longer appears in it. Run with:  python tests/run_tests.py
 """
+import gzip
 import hashlib
+import io
 import json
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -133,11 +137,21 @@ def test_zip(tmp):
         z.write(SAMPLES / 'zyxel.conf', '../../outside/zyxel.conf')
         z.write(SAMPLES / 'netgear-m4300.cfg', 'switches/netgear-m4300.cfg')
     code, out = run(['configs.zip'], work)
-    copies = outputs(work, '_SANITIZED')
-    check('zip: one copy per file inside', len(copies) == 2, out[-500:])
-    check('zip: no LEAK left', all('LEAK' not in text(p) for p in copies))
-    check('zip: nothing written outside the folder', not (tmp / 'outside').exists())
+    folder = work / 'configs_SANITIZED'
+    copies = sorted(p.relative_to(folder).as_posix() for p in folder.rglob('*') if p.is_file()) if folder.is_dir() else []
+    check('zip: several files give a folder with the same tree', copies == ['outside/zyxel.conf', 'switches/netgear-m4300.cfg'],
+          str(copies) + out[-500:])
+    check('zip: no LEAK left', all('LEAK' not in text(folder / p) for p in copies))
+    check('zip: nothing written outside the folder (zip slip)', not (tmp / 'outside').exists())
     check('zip: originals never extracted', not (work / 'switches').exists() and not (work / 'zyxel.conf').exists())
+    # a second run never touches the first folder
+    code, out = run(['configs.zip'], work)
+    check('zip: existing folder never reused', len([p for p in work.iterdir() if p.is_dir() and p.name.startswith('configs') and p.name.endswith('_SANITIZED')]) == 2)
+    # one file inside: the copy takes the archive's name
+    with zipfile.ZipFile(work / 'router.conf.zip', 'w') as z:
+        z.write(SAMPLES / 'cisco.conf', 'exports/cisco.conf')
+    code, out = run(['router.conf.zip'], work)
+    check('zip: single file named after the archive', (work / 'router_SANITIZED.conf').exists(), out[-300:])
 
 
 def test_3cx(tmp):
@@ -164,6 +178,90 @@ def test_3cx(tmp):
         check('3cx: no LEAK left', 'LEAK' not in body)
         check('3cx: technical setting kept', '192.0.2.10' in body)
     check('3cx: skipped folders listed', 'Skipped: DbTables' in out and 'Skipped: recordings' in out)
+
+
+def test_freepbx(tmp):
+    work = tmp / 'freepbx'
+    work.mkdir()
+    # level 1 on the Asterisk sample: PINs, register lines, dial strings and the [secret] section
+    shutil.copy(SAMPLES / 'asterisk.conf', work)
+    code, out = run(['asterisk.conf'], work)
+    body = text(work / 'asterisk_SANITIZED.conf')
+    check('asterisk: format recognised', 'Asterisk / FreePBX' in out)
+    check('asterisk: register secret masked, host kept', 'register => 1001:REDACTED@sip.provider.example/1001' in body)
+    check('asterisk: register with authuser', 'REDACTED:authuser1002@sip.provider.example' in body)
+    check('asterisk: voicemail PIN masked, name and options kept', '1001 => REDACTED,John Smith,john.smith@example.com,,attach=yes' in body)
+    check('asterisk: dial string credentials masked', 'Dial(SIP/trunk:REDACTED@sip.provider.example/${EXTEN})' in body
+          and 'IAX2/iaxuser:REDACTED@iax.provider.example' in body)
+    check('asterisk: [secret] section value masked', '[secret]\nREDACTED\n[1]' in body)
+    check('asterisk: trailing comment not kept after a secret', 'LEAKgeneral' not in body and 'alwaysauthreject=yes' in body)
+    # level 2 adds caller ID names, voicemail names and SIP account names
+    code, out = run(['-p', 'asterisk.conf', '-o', 'p2', '--no-map'], work)
+    body = text(work / 'p2' / 'asterisk_ANONYMIZED.conf')
+    check('asterisk: caller ID name anonymised, number kept', 'callerid="NAME_1 NAME_2" <1001>' in body)
+    check('asterisk: voicemail name and email anonymised', '1001 => REDACTED,NAME_1 NAME_2,EMAIL_1,,attach=yes' in body
+          and '1002 => REDACTED,NAME_3 NAME_4,,' in body)
+    check('asterisk: trunk account anonymised consistently', body.count('USER_1') == 2 and 'trunkaccount' not in body)
+    check('asterisk: register line not mistaken for an email', 'register => 1001:REDACTED@sip.provider.example/1001' in body
+          and 'REDACTED:authuser1002@sip.provider.example' in body)
+    # SQL dump and FreePBX JSON
+    code, out = run([SAMPLES / 'freepbx-devices.sql', SAMPLES / 'freepbx-core.json', '-o', 'db'], work)
+    sql = text(work / 'db' / 'freepbx-devices_SANITIZED.sql')
+    check('sql: keyword/data rows masked by keyword name', "('1001','secret','REDACTED',0)" in sql and "('1001','md5secret','REDACTED',0)" in sql
+          and "('1001','context','from-internal',0)" in sql)
+    check('sql: secret columns found through CREATE TABLE', "('admin','REDACTED','')" in sql and "('operator','REDACTED','100')" in sql)
+    check('sql: explicit column list honoured', "('readonly', 'REDACTED')" in sql)
+    check('sql: PostgreSQL COPY block', '1\tbob\tCleartext-Password\t:=\tREDACTED' in sql and '\t:=\tnever' in sql)
+    check('sql: structure untouched', 'PRIMARY KEY (`id`,`keyword`)' in sql)
+    check('sql: rows continued on the next lines', "('1002','secret','REDACTED',52)" in sql and "('1002','md5secret','REDACTED',52);" in sql
+          and "('1002','context','from-internal',13)" in sql)
+    js = text(work / 'db' / 'freepbx-core_SANITIZED.json')
+    check('freepbx json: keyword/data over several lines', '"data": "REDACTED"' in js and '"data": "sip.provider.example"' in js
+          and '"data": "trunkaccount"' in js)
+    check('freepbx json: compact keyword/data', '"keyword": "secret", "data": "REDACTED"' in js and '"data": "from-trunk"' in js)
+    check('freepbx json: settings masked, setting sizes kept', '"AMPMGRPASS": "REDACTED"' in js and '"SIPSECRETSIZE": "32"' in js)
+    check('freepbx json: nothing left to review', 'Lines to review locally: none flagged' in out.split('freepbx-core.json')[-1])
+    code, out = run(['-p', SAMPLES / 'freepbx-devices.sql', SAMPLES / 'freepbx-core.json', '-o', 'db2', '--no-map'], work)
+    sql2, js2 = text(work / 'db2' / 'freepbx-devices_ANONYMIZED.sql'), text(work / 'db2' / 'freepbx-core_ANONYMIZED.json')
+    check('freepbx level 2: user names in SQL rows and keyword/data rows', 'John' not in sql2 and 'Jane' not in sql2
+          and "('1001','callerid','NAME_1 NAME_2 <1001>',0)" in sql2 and "('1001','','NAME_1 NAME_2','default')" in sql2)
+    check('freepbx level 2: user names in module JSON', 'John' not in js2 and '"name": "NAME_1 NAME_2"' in js2
+          and '"description": "NAME_1 NAME_2"' in js2 and '"module": "core"' in js2)
+    # a FreePBX-style tar.gz: folder output, audio and call records skipped, nested gzip and keys handled
+    def add(tf, name, data):
+        ti = tarfile.TarInfo(name)
+        ti.size, ti.mtime = len(data), int(time.time())
+        tf.addfile(ti, io.BytesIO(data))
+    with tarfile.open(work / '20260101-010203-17.0.1-12345.tar.gz', 'w:gz') as tf:
+        add(tf, 'modulejson/Core.json', (SAMPLES / 'freepbx-core.json').read_bytes())
+        add(tf, 'modulejson/Calendar.json', b'{"module": "calendar", "pbx_version": null, "configs": {"noid": []}}\n')
+        add(tf, 'customdir/etc/asterisk/manager.conf', (SAMPLES / 'asterisk.conf').read_bytes())
+        add(tf, 'files/tmp/Devices_dump/Devices.sql', (SAMPLES / 'freepbx-devices.sql').read_bytes())
+        add(tf, 'files/tmp/cdr_dump/cdr.sql.gz', gzip.compress(b"INSERT INTO cdr VALUES ('+15550100','LEAKcdr');\n"))
+        add(tf, 'files/var/lib/asterisk/moh/wait.wav', b'RIFF' + bytes(range(256)) * 4)
+        add(tf, 'files/etc/asterisk/keys/default.key', b'-----BEGIN PRIVATE KEY-----\nLEAKkey\n-----END PRIVATE KEY-----\n')
+        add(tf, 'files/etc/asterisk/keys/default.crt', b'-----BEGIN CERTIFICATE-----\nMIIBpublicCERTOK\n-----END CERTIFICATE-----\n')
+        add(tf, 'files/etc/asterisk/notes.txt.gz', gzip.compress(b'password=LEAKnested\n'))
+        add(tf, '../evil.conf', b'password=LEAKslip\n')
+    code, out = run(['20260101-010203-17.0.1-12345.tar.gz'], work)
+    folder = work / '20260101-010203-17.0.1-12345_SANITIZED'
+    files = sorted(p.relative_to(folder).as_posix() for p in folder.rglob('*') if p.is_file()) if folder.is_dir() else []
+    check('tar: FreePBX backup recognised', 'FreePBX / Asterisk backup' in out, out[-400:])
+    check('tar: folder mirrors the archive, audio and CDR left out', files == [
+        'customdir/etc/asterisk/manager.conf', 'evil.conf', 'files/etc/asterisk/keys/default.crt',
+        'files/etc/asterisk/keys/default.key', 'files/etc/asterisk/notes.txt', 'files/tmp/Devices_dump/Devices.sql',
+        'modulejson/Calendar.json', 'modulejson/Core.json'], str(files))
+    check('tar: skipped groups reported', 'audio and voicemail' in out and 'call records (CDR/CEL)' in out)
+    check('tar: no LEAK in any copy', folder.is_dir() and not [p for p in folder.rglob('*') if p.is_file() and 'LEAK' in text(p)])
+    check('tar: zip slip contained', not (tmp / 'evil.conf').exists() and (folder / 'evil.conf').exists())
+    check('tar: private key replaced, certificate kept', '[REDACTED_PRIVATE_KEY]' in text(folder / 'files/etc/asterisk/keys/default.key')
+          and 'MIIBpublicCERTOK' in text(folder / 'files/etc/asterisk/keys/default.crt'))
+    check('tar: unchanged files listed', 'copied unchanged' in out and 'Calendar.json' in out)
+    # a single gzip-compressed configuration
+    with gzip.open(work / 'running.conf.gz', 'wb') as g:
+        g.write((SAMPLES / 'cisco.conf').read_bytes())
+    code, out = run(['running.conf.gz'], work)
+    check('gzip: single compressed file handled', (work / 'running_SANITIZED.conf').exists() and 'LEAK' not in text(work / 'running_SANITIZED.conf'), out[-300:])
 
 
 def test_cli(tmp):
@@ -259,8 +357,8 @@ def test_identities(tmp):
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='netblur-tests-'))
     try:
-        for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_cli,
-                     test_identities):
+        for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_freepbx,
+                     test_cli, test_identities):
             print('--- ' + test.__name__)
             test(tmp)
     finally:

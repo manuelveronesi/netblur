@@ -1,5 +1,14 @@
 ### Changelog
 
+### 3.2
+- Asterisk and FreePBX: `key => value` syntax, `register =>` credentials, `Dial(SIP/user:secret@host)` strings, voicemail PINs, dialplan `Set(...password...)=`, `[secret]` sections, `AMPMGRPASS`/`AMPDBPASS` and similar compound names
+- FreePBX module data (JSON): keyword/data rows masked by keyword name, also across lines
+- SQL dumps: secret columns found through `CREATE TABLE` or the explicit column list of `INSERT`, keyword/data tables, PostgreSQL `COPY` blocks
+- TAR, `.tar.gz`, `.tgz` and `.gz` inputs, read in memory like ZIP; nested `.gz` members expanded in memory
+- Archives with several files now produce a folder with the same tree (`backup_SANITIZED/...`) instead of flat `archive__file` copies; audio and binary members are skipped and counted; FreePBX call records (CDR/CEL), music on hold, recordings and voicemail are never written out
+- Level 2: caller ID names, voicemail names and SIP account names (`username`, `fromuser`, `auth_username`) in Asterisk and FreePBX files; `<number>` parts of caller IDs kept
+- Setting names such as `SIPSECRETSIZE` or `passwordlength` are no longer masked; fewer review flags on SQL structure, section headers and JSON keyword names
+
 ### 3.1
 - Level 2 now blurs the identity of the network too: hostnames (`HOST_n`), domains (`example-n.net`, also as FQDN suffixes), public IPv4 and IPv6 addresses (documentation ranges, consistent per run), MAC addresses (locally administered, format preserved) and user-supplied words (`-w`, `--words-file`)
 - `--all-ips`, `--keep-ips`, `--keep-macs`

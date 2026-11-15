@@ -4,12 +4,13 @@
 
 Usage: netblur [options] INPUT [INPUT ...]
 
-INPUT can be a configuration file, a ZIP archive, a directory (processed
-recursively) or "-" for standard input. By default each copy is written next
-to its original with the _SANITIZED suffix, or _NO-SECRETS-FOUND when nothing
-was masked. Originals are never modified and existing files are never
-overwritten. ZIP archives are read in memory and only sanitized copies reach
-the disk. The copies are NOT meant to be restored onto a device.
+INPUT can be a configuration file, an archive (ZIP, TAR, .tar.gz, .gz), a
+directory (processed recursively) or "-" for standard input. By default each
+copy is written next to its original with the _SANITIZED suffix, or
+_NO-SECRETS-FOUND when nothing was masked; an archive with several files gives
+a folder with the same tree. Originals are never modified and existing files
+are never overwritten. Archives are read in memory and only sanitized copies
+reach the disk. The copies are NOT meant to be restored onto a device.
 
 Level 1 (default): passwords, keys, communities, PINs, tokens and hashes.
 Level 2 (--personal): names, usernames, email addresses and phone numbers are
@@ -18,15 +19,18 @@ shared by every file of the run, and the copies get the _ANONYMIZED suffix.
 A JSON map links each placeholder to the real value: keep it local, never share it.
 """
 import argparse
-import json
 import codecs
+import gzip
+import io
+import json
 import re
 import sys
+import tarfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '3.1'
+VERSION = '3.2'
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s]+')
 
@@ -87,7 +91,8 @@ SECRET_NAME = re.compile(
     r'md5-?key|static-?key|community|shadow|iapp|api-?key|token|wep-?key|key-?string|credential|'
     r'(?:^|[-_.])prv$|shared[-_]?key|(?:^|[-_.])key$|hash$|(?:^|[-_.])tls$|'
     r'pin$|pincode|licen[sc]e[-_]?key|(?:^|[-_.])auth[-_]?id$|^authid$|2fa|totp|(?:^|[-_.])otp(?:$|[-_.])|'
-    r'salt$|cookie|session[-_]?(?:id|key|token)')
+    r'salt$|cookie|session[-_]?(?:id|key|token)|'
+    r'(?:db|mgr|vm|sip|iax|ami|ari|ldap|web|admin|user|auth|pg|mysql|sql|smtp|mail|proxy|radius|ftp|sftp)pass$|^amp\w*pass$')
 # Name/Value pairs (3CX DNProperty and similar): the secret is in <Value>, its name in <Name>.
 NV_SECRET_NAME = re.compile(r'pass|secret|pin|key|token|hash|rps|quickmeeting|openlink|services_access|'
                             r'signing|private|otp|totp|apikey|credential|pwd|authid', re.I)
@@ -106,12 +111,14 @@ EXCL_LAST = {
     'index', 'size', 'profile', 'time', 'date', 'interval', 'version', 'level', 'file', 'path',
     'url', 'hint', 'reset', 'recovery',
 }
+SETTING_SUFFIX = ('size', 'length', 'count', 'enabled', 'policy', 'timeout', 'interval', 'expires', 'expiry',
+                  'history', 'complexity', 'strength', 'minlen', 'maxlen', 'format', 'required')
 TRIVIAL = {'', 'yes', 'no', 'true', 'false', 'enable', 'enabled', 'disable', 'disabled', 'none',
            'auto', 'on', 'off', 'redacted', 'null'}
 
-KV = re.compile(r'(?<![\w.\-"\'])(?P<name>[A-Za-z_][\w.\-]*)(?P<eq>\s*=\s*)'
+KV = re.compile(r'(?<![\w.\-"\'])(?P<name>[A-Za-z_][\w.\-]*)(?P<eq>\s*=>?\s*)'
                 r'(?P<val>"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s"\'=][^\s]*|(?=\s|$))')
-KV_LINE = re.compile(r'^(?P<pre>\s*(?P<name>[A-Za-z_][\w.\-]*)\s*=\s*)(?P<val>.*?)(?P<cont>\s+\\)?$')
+KV_LINE = re.compile(r'^(?P<pre>\s*(?P<name>[A-Za-z_][\w.\-]*)\s*=>?\s*)(?P<val>.*?)(?P<cont>\s+\\)?$')
 JSONPAIR = re.compile(r'"(?P<name>(?:\\.|[^"\\])*)"\s*:\s*(?P<val>"(?:\\.|[^"\\])*")')
 XMLELEM = re.compile(r'<(?P<tag>[A-Za-z_][\w.:-]*)(?P<attrs>\s[^<>]*)?>(?P<val>[^<]*)</(?P=tag)\s*>')
 XMLOPEN = re.compile(r'<(?P<tag>[A-Za-z_][\w.:-]*)(?:\s[^<>]*)?>(?P<val>[^<]*)$')
@@ -125,14 +132,37 @@ BENIGN = re.compile(r'service password-encryption|password encryption|authentica
                     r'crypto key generate|^\s*key chain\b|^\s*key \d+\s*$|authmethod psk|psk-type|'
                     r'mode pre-shared-secret|-password ""|authentication-types=|^/(?:ppp secret|snmp community)|'
                     r'^\s*config system snmp community|"key"\s*:\s*"|_required"\s*:|'
-                    r'^\s*config\s|^\s*set type password\s*$|^\s*set \S*cipher\S*\s|^\s*set \S*(?:password|passwd|pwd)\S* \d+\s*$', re.I)
-REVIEW_IGNORE = re.compile(r'\w*(?:secret|pass\w*|pwd|pin|key|token)\w*=(?:""|\'\')|<(Name|name|Description|description)>[^<]*</\1>', re.I)
-CERT_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]*CERTIFICATE[A-Z ]*-----')
-CERT_END = re.compile(r'-----END [A-Z0-9 ]*CERTIFICATE[A-Z ]*-----')
+                    r'^\s*config\s|^\s*set type password\s*$|^\s*set \S*cipher\S*\s|^\s*set \S*(?:password|passwd|pwd)\S* \d+\s*$|'
+                    r'^\s*(?:CREATE TABLE|PRIMARY KEY|UNIQUE KEY|KEY `|`\w+` (?:varchar|text|int|char|tinyint|bigint|blob|datetime))|'
+                    r'password_format\s*=|"(?:filename|pathto|path|file)"\s*:', re.I)
+REVIEW_IGNORE = re.compile(r'\w*(?:secret|pass\w*|pwd|pin|key|token)\w*=(?:""|\'\')|"\w*(?:secret|pass\w*|pwd|pin|key|token)\w*"\s*:\s*""|<(Name|name|Description|description)>[^<]*</\1>|'
+                           r'"(?:keyword|attribute|setting|option|param|parameter|property|variable)"\s*:\s*"[^"]*"|'
+                           r'[\'`"]\w*(?:secret|pass\w*|pwd|pin|key|token)\w*[\'`"]\s*[,)]|^\s*\[[^\]]+\]\s*$', re.I | re.M)
+CERT_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]*(?:CERTIFICATE|PUBLIC KEY)[A-Z ]*-----')
+CERT_END = re.compile(r'-----END [A-Z0-9 ]*(?:CERTIFICATE|PUBLIC KEY)[A-Z ]*-----')
+COMMENT = re.compile(r'^\s*(?:;|#|//|--|!)')
 # Credentials embedded as user:password@host, in URLs or in Fortinet backup/automation commands.
 URL_CRED = re.compile(r'(?i)\b[a-z][a-z0-9+.-]*://([^:/@\s"\']+):([^\s"\']+)@([^@\s"\'/]+)')
 CMD_CRED = re.compile(r'([A-Za-z0-9._-]+):([^\s"\']+)@([^@\s"\'/:]+)')
 CMD_CRED_TRIGGER = re.compile(r'(?i)set script|execute backup|execute restore')
+# Asterisk: register => [peer?][transport://]user[@domain]:secret[:authuser]@host, and dial strings with credentials.
+AST_REGISTER = re.compile(r'(?i)^\s*register\s*=>\s*(?:\w+\?)?(?:\w+://)?[^\s:]+(?:@[^\s:@]+)?:(?P<secret>[^:@\s]+)(?=(?::[^@\s]+)?@)')
+AST_DIAL = re.compile(r'(?i)\b(?:SIP|PJSIP|IAX2?|SKINNY)/[^/:@\s,()]+:(?P<secret>[^@/\s,()]+)@')
+# Dialplan assignments to a secret-named key: Set(DB(AMPUSER/103/password)=x), Set(SECRET=x)
+DIALPLAN_SET = re.compile(r'(?i)\bSet\((?:\w+\([^()]*?)?[\w/]*(?:password|passwd|secret|pin|pwd|token)\s*\)?\s*=\s*(?P<val>[^,)]+)')
+# Asterisk voicemail.conf: mailbox => PIN,Full Name,email,pager,options
+VM_ENTRY = re.compile(r'^(\s*\d+\s*=>\s*)(\d{2,})(\s*,)')
+VM_NAME_ENTRY = re.compile(r'^\s*\d+\s*=>\s*(?:\d{2,}|REDACTED)\s*,')
+INI_SECTION = re.compile(r'^\s*\[([^\]\n]+)\]')
+# FreePBX tables stored as keyword/data rows (sip, iax, pjsip, queues_details...): the keyword names the secret.
+KW_NAMES = {'keyword', 'attribute', 'setting', 'option', 'param', 'parameter', 'property', 'variable', 'var'}
+VAL_NAMES = {'data', 'value', 'val', 'content', 'setting_value', 'option_value', 'param_value'}
+JSON_KEYWORD = re.compile(r'"(?:keyword|attribute|setting|option|param|parameter|property|variable)"\s*:\s*"(?P<name>[^"]*)"')
+JSON_DATA = re.compile(r'"(?:data|value|val|content)"\s*:\s*(?P<val>"(?:\\.|[^"\\])*")')
+SQL_CREATE = re.compile(r'(?i)^\s*CREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"\[]?(?:\w+[`"\]]?\.)?[`"\[]?(?P<table>\w+)[`"\]]?\s*(?P<paren>\()?')
+SQL_INSERT = re.compile(r'(?i)^\s*(?:INSERT|REPLACE)\s+(?:IGNORE\s+)?INTO\s+[`"\[]?(?:\w+[`"\]]?\.)?[`"\[]?(?P<table>\w+)[`"\]]?\s*(?:\((?P<cols>[^)]*)\))?\s*VALUES\s*')
+SQL_COPY = re.compile(r'(?i)^\s*COPY\s+(?:\w+\.)?"?(?P<table>\w+)"?\s*\((?P<cols>[^)]*)\)\s+FROM\s+stdin')
+SQL_STRING = re.compile(r"'(?:[^'\\]|\\.|'')*'")
 SUSPECT = re.compile(r'password|passwd|passphrase|pwd|secret|psk|preshar|pre-shar|community|private.?key|'
                      r'token|credential|api.?key|\bkey\b|\$\d\$|\bENC\b|cipher|shadow', re.I)
 PEM_MARK = '[REDACTED_PRIVATE_KEY]'
@@ -165,6 +195,8 @@ def is_secret_name(name, json=False):
     parts = [p for p in re.split(r'[-_.]', low) if p]
     if parts and parts[-1] in EXCL_LAST:
         return False
+    if len(low) > 6 and low.endswith(SETTING_SUFFIX):
+        return False
     return bool(SECRET_NAME.search(low))
 
 
@@ -182,6 +214,12 @@ class Context:
         self.in_pem = False
         self.nv_secret = False
         self.nv_name = ''
+        self.ini_secret = False   # inside an INI section whose name says it holds secrets ([secret])
+        self.kw_secret = False    # a JSON "keyword" naming a secret was seen; the next "data" is its value
+        self.sql_tables = {}      # table -> list of column names, from CREATE TABLE statements
+        self.sql_create = None    # table whose CREATE TABLE is being read line by line
+        self.sql_copy = None      # columns of a PostgreSQL COPY block being read
+        self.sql_insert = None    # columns of an INSERT whose rows continue on the following lines
 
 
 def scan_json(body):
@@ -228,6 +266,202 @@ def scan_kv(body, ctx):
         if secret and val and not trivial(val):
             spans.append((m.start('val'), m.end('val'), mask(val)))
     return spans
+
+
+SQL_CONSTRAINTS = {'PRIMARY', 'KEY', 'UNIQUE', 'INDEX', 'CONSTRAINT', 'FOREIGN', 'CHECK', 'FULLTEXT', 'SPATIAL', 'PERIOD'}
+
+
+def split_top(text, sep=','):
+    """Split on sep outside quotes and parentheses; returns (start, end) spans of the items."""
+    items, start, depth, i, n = [], 0, 0, 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in '\'"`':
+            m = SQL_STRING.match(text, i) if c == "'" else re.compile(c + r'(?:[^' + c + r'\\]|\\.)*' + c).match(text, i)
+            if not m:
+                break
+            i = m.end()
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif c == sep and depth == 0:
+            items.append((start, i))
+            start = i + 1
+        i += 1
+    items.append((start, n))
+    return items
+
+
+def sql_columns(defs):
+    """Column names from the body of a CREATE TABLE (...)."""
+    cols = []
+    for s, e in split_top(defs):
+        m = re.match(r'\s*[`"\[]?(\w+)[`"\]]?', defs[s:e])
+        if m and m.group(1).upper() not in SQL_CONSTRAINTS:
+            cols.append(m.group(1).lower())
+    return cols
+
+
+def sql_tuples(body, start):
+    """(start, end) spans of the items of every (...) tuple that follows position start."""
+    tuples, i, n = [], start, len(body)
+    while i < n:
+        c = body[i]
+        if c == '(':
+            depth, j = 1, i + 1
+            while j < n and depth:
+                ch = body[j]
+                if ch in '\'"':
+                    m = SQL_STRING.match(body, j) if ch == "'" else re.compile(r'"(?:[^"\\]|\\.)*"').match(body, j)
+                    if not m:
+                        return tuples
+                    j = m.end()
+                    continue
+                depth += (ch == '(') - (ch == ')')
+                j += 1
+            inner = body[i + 1:j - 1]
+            tuples.append([(i + 1 + s, i + 1 + e) for s, e in split_top(inner)])
+            i = j
+        elif c == ';':
+            break
+        else:
+            i += 1
+    return tuples
+
+
+def sql_row_spans(body, items, cols, strings=True):
+    """Spans to mask in one row: secret columns, and the value column of keyword/value rows."""
+    spans = []
+    kw = [k for k, c in enumerate(cols) if c in KW_NAMES]
+    val = [k for k, c in enumerate(cols) if c in VAL_NAMES]
+    targets = [k for k, c in enumerate(cols) if is_secret_name(c)]
+    if kw and val and kw[0] < len(items):
+        s, e = items[kw[0]]
+        name = unquote(body[s:e].strip()) if strings else body[s:e].strip()
+        if is_secret_name(name):
+            targets += val
+    for k in targets:
+        if k >= len(items):
+            continue
+        s, e = items[k]
+        raw = body[s:e]
+        v = raw.strip()
+        if strings:
+            if v[:1] not in '\'"' or trivial(v) or v.strip('\'"').upper() in ('NULL', 'REDACTED'):
+                continue
+            lead = len(raw) - len(raw.lstrip())
+            spans.append((s + lead, s + lead + len(v), v[0] + 'REDACTED' + v[0]))
+        elif v and v not in ('\\N', 'REDACTED'):
+            spans.append((s, e, 'REDACTED'))
+    return spans
+
+
+def iter_sql_rows(text):
+    """(table, columns, values) for every INSERT row and COPY line of a SQL dump; values are unquoted strings or None."""
+    ctx = Context()
+    insert_table = None
+    for line in text.splitlines():
+        body = line.rstrip('\r\n')
+        if ctx.sql_create is not None or (ctx.sql_copy is None and ctx.sql_insert is None and SQL_CREATE.match(body)):
+            scan_sql(body, ctx)
+            continue
+        if ctx.sql_copy is not None:
+            if body.strip() == '\\.':
+                ctx.sql_copy = None
+            else:
+                yield insert_table, ctx.sql_copy, [None if f == '\\N' else f for f in body.split('\t')]
+            continue
+        m = SQL_COPY.match(body)
+        if m:
+            insert_table = m.group('table').lower()
+            scan_sql(body, ctx)
+            continue
+        m = SQL_INSERT.match(body)
+        if m or ctx.sql_insert is not None:
+            if m:
+                insert_table = m.group('table').lower()
+            cols, start = (ctx.sql_insert, 0) if not m else (None, m.end())
+            scan_sql(body, ctx)  # keeps ctx.sql_insert up to date
+            cols = cols or ctx.sql_insert or (ctx.sql_tables.get(insert_table, []) if m else [])
+            if m and m.group('cols'):
+                cols = [c.strip().strip('`"[]').lower() for c in m.group('cols').split(',')]
+            if not cols:
+                continue
+            for items in sql_tuples(body, start):
+                values = []
+                for a, b in items:
+                    v = body[a:b].strip()
+                    values.append(unquote(v).replace("''", "'").replace("\\'", "'") if v[:1] in '\'"' else None)
+                yield insert_table, cols, values
+
+
+def scan_sql(body, ctx):
+    """SQL dumps: secret columns of INSERT rows and PostgreSQL COPY blocks, found through CREATE TABLE."""
+    spans = []
+    if ctx.sql_create is not None:
+        s = body.strip()
+        if s.startswith(')'):
+            ctx.sql_create = None
+        elif s and not s.startswith(('--', '/*')):
+            ctx.sql_tables[ctx.sql_create] += sql_columns(s.rstrip(','))
+        return spans
+    if ctx.sql_copy is not None:
+        if body.strip() == '\\.':
+            ctx.sql_copy = None
+            return spans
+        line = body.rstrip('\r\n')
+        items, pos = [], 0
+        for f in line.split('\t'):
+            items.append((pos, pos + len(f)))
+            pos += len(f) + 1
+        return sql_row_spans(body, items, ctx.sql_copy, strings=False)
+    m = SQL_CREATE.match(body)
+    if m:
+        table = m.group('table').lower()
+        rest = body[m.end():]
+        if m.group('paren') and ')' in rest and re.search(r'\)\s*(?:ENGINE|WITH|;|$)', rest.rstrip(), re.I):
+            close = rest.rfind(')')
+            ctx.sql_tables[table] = sql_columns(rest[:close])
+        else:
+            ctx.sql_tables[table] = []
+            ctx.sql_create = table
+        return spans
+    m = SQL_COPY.match(body)
+    if m:
+        ctx.sql_copy = [c.strip().strip('"').lower() for c in m.group('cols').split(',')]
+        return spans
+    m = SQL_INSERT.match(body)
+    if m or ctx.sql_insert is not None:
+        if m:
+            cols = ([c.strip().strip('`"[]').lower() for c in m.group('cols').split(',')] if m.group('cols')
+                    else ctx.sql_tables.get(m.group('table').lower(), []))
+            start = m.end()
+        else:
+            cols, start = ctx.sql_insert, 0
+        if cols:
+            for items in sql_tuples(body, start):
+                spans += sql_row_spans(body, items, cols)
+        # Rows may continue on the next lines until the statement ends with ";".
+        ctx.sql_insert = cols if cols and not sql_statement_ends(body, start) else None
+    return spans
+
+
+def sql_statement_ends(body, start):
+    i, n = start, len(body)
+    while i < n:
+        c = body[i]
+        if c in '\'"':
+            m = SQL_STRING.match(body, i) if c == "'" else re.compile(r'"(?:[^"\\]|\\.)*"').match(body, i)
+            if not m:
+                return False
+            i = m.end()
+            continue
+        if c == ';':
+            return True
+        i += 1
+    return False
 
 
 def secret_keyword(i, words, raw):
@@ -301,6 +535,10 @@ def scan_cli(body, ctx, taken):
 
 def update_sections(body, ctx):
     s = body.strip()
+    m = INI_SECTION.match(body)
+    if m and not s.startswith('[['):
+        name = m.group(1).strip()
+        ctx.ini_secret = is_secret_name(name) and not name.startswith(('"', "'"))
     m = re.match(r'^config\s+(.+?)\s*$', s)
     if m:
         ctx.forti_stack.append(m.group(1).lower())
@@ -347,7 +585,19 @@ def clean_line(line, ctx):
     update_sections(body, ctx)
     was_open = ctx.xml_open
     stripped = body.lstrip()
+    # Bare values under an INI section named after a secret, e.g. [secret] in FreePBX cdrpro_events.
+    if ctx.ini_secret and stripped and not stripped.startswith(('[', ';', '#')) and '=' not in stripped:
+        return body[:len(body) - len(stripped)] + 'REDACTED' + newline, True
     spans = []
+    for m in ([AST_REGISTER.match(body)] if '=>' in body else []) + list(AST_DIAL.finditer(body)):
+        if m and m.group('secret').lower() != 'redacted':
+            spans.append((m.start('secret'), m.end('secret'), 'REDACTED'))
+    m = VM_ENTRY.match(body)
+    if m:
+        spans.append((m.start(2), m.end(2), 'REDACTED'))
+    for m in DIALPLAN_SET.finditer(body):
+        if not trivial(m.group('val')) and m.group('val').strip().lower() != 'redacted':
+            spans.append((m.start('val'), m.end('val'), 'REDACTED'))
     creds = list(URL_CRED.finditer(body))
     if CMD_CRED_TRIGGER.search(body):
         creds += [m for m in CMD_CRED.finditer(body) if not spans_cover([(c.start(), c.end(), '') for c in creds], m.start(2))]
@@ -374,16 +624,29 @@ def clean_line(line, ctx):
             spans.append((m.start(2), m.end(2), 'REDACTED'))
     if is_json:
         spans += scan_json(body)
+        kw = JSON_KEYWORD.search(body)
+        if kw:
+            ctx.kw_secret = is_secret_name(kw.group('name'))
+        d = JSON_DATA.search(body, kw.end() if kw else 0)
+        if ctx.kw_secret and d and not trivial(d.group('val')) and not spans_cover(spans, d.start('val')):
+            spans.append((d.start('val'), d.end('val'), '"REDACTED"'))
+            ctx.kw_secret = False
+        if '}' in body and not kw:
+            ctx.kw_secret = False
+    is_sql = ctx.sql_create is not None or ctx.sql_copy is not None or ctx.sql_insert is not None or bool(
+        SQL_CREATE.match(body) or SQL_INSERT.match(body) or SQL_COPY.match(body))
+    if is_sql:
+        spans += [s for s in scan_sql(body, ctx) if not spans_cover(spans, s[0])]
     if is_xml or re.search(r'<[A-Za-z_][\w.:-]*[\s>]', body):
         spans += [s for s in scan_xml(body, ctx) if not spans_cover(spans, s[0])]
-    if not is_json:
+    if not is_json and not is_sql:
         spans += [s for s in scan_kv(body, ctx) if not spans_cover(spans, s[0])]
         for rx in (EXOS_ACCOUNT, SNMP_HOST):
             m = rx.search(body)
             if m and not spans_cover(spans, m.start(2)) and not (rx is SNMP_HOST and ' community ' in body.lower()):
                 if not trivial(m.group(2)) and m.group(2).strip('"\'').lower() != 'redacted':
                     spans.append((m.start(2), m.end(2), mask(m.group(2))))
-    if not is_json and not is_xml and not stripped.startswith('/'):
+    if not is_json and not is_xml and not is_sql and not stripped.startswith('/'):
         spans += scan_cli(body, ctx, spans)
     if not spans:
         return line, bool(ctx.xml_open and not was_open)
@@ -418,6 +681,10 @@ def detect_format(text):
         ('Cisco IOS or compatible (Netgear, TP-Link, Aruba...)', re.search(r'^(hostname|version \d+\.\d+|interface \S+)', head, re.M)),
         ('WireGuard', re.search(r'^\[(Interface|Peer)\]', head, re.M)),
         ('OpenVPN', re.search(r'^(client|remote \S+|<ca>|<tls-auth>)', head, re.M)),
+        ('FreePBX module data (JSON)', '"pbx_version"' in low and '"module"' in low),
+        ('Asterisk / FreePBX configuration', re.search(r'(?im)^\s*(?:exten|same)\s*=>|^\s*type\s*=\s*(?:endpoint|friend|peer|aor|auth|identify|registration)\s*$|'
+                                                       r'auto-generated by freepbx|^\s*register\s*=>|^;.*asterisk', head)),
+        ('SQL dump', re.search(r'(?im)^\s*(?:CREATE TABLE|INSERT INTO|COPY \S+ .*FROM stdin|-- MySQL dump|-- PostgreSQL database dump)', head)),
         ('JSON', re.match(r'\s*[\[{]\s*["{\[]', head)),
         ('XML', head.lstrip().startswith('<')),
     ]
@@ -438,8 +705,9 @@ def redact(text):
         starts_cert = bool(CERT_BEGIN.search(line))
         if modified:
             changed.append(number)
-        elif not (in_cert or starts_cert) and SUSPECT.search(REVIEW_IGNORE.sub('', line)) and not BENIGN.search(line):
-            review.append(number)
+        elif not (in_cert or starts_cert) and SUSPECT.search(REVIEW_IGNORE.sub('', line)) and not BENIGN.search(line) \
+                and not (COMMENT.match(line) and '=' not in line and ':' not in line):
+            review.append(number)  # prose comments are not flagged, commented-out assignments are
         if starts_cert:
             in_cert = True
         if CERT_END.search(line):
@@ -486,8 +754,12 @@ CONTACT_CMD = re.compile(r'(?i)^\s*(?:snmp-server contact|snmp-agent sys-info co
 NAME_TAGS = re.compile(r'<(FirstName|LastName|DisplayName|FullName|Surname|GivenName|CustomName|CompanyName|'
                        r'ContactName|contact|company)>([^<]+)</\1>', re.I)
 NAME_KEYS = re.compile(r'(?i)"(first[-_]?name|last[-_]?name|full[-_]?name|display[-_]?name|surname|given[-_]?name|'
-                       r'contact[-_]?name)"\s*:\s*"([^"]+)"|'
+                       r'contact[-_]?name|fname|lname|displayname|callerid|cid_name|calleridname|outboundcid)"\s*:\s*"([^"]+)"|'
                        r'(?<![\w-])(first[-_]?name|last[-_]?name|full[-_]?name|display[-_]?name)\s*=\s*("[^"]+"|\S+)')
+# Asterisk: caller ID names and SIP/IAX account names (the number part <1001> is left alone).
+AST_CALLERID = re.compile(r'(?i)^\s*(?:callerid|cid_name|calleridname|fullname|outboundcid)\s*=>?\s*(.+?)\s*$')
+AST_USER = re.compile(r'(?i)^\s*(?:username|fromuser|defaultuser|authuser|auth_username|remoteuser|user_name)\s*=>?\s*(\S+)')
+USER_KEYS = re.compile(r'(?i)"(?:username|fromuser|defaultuser|authuser|auth_username|user_name)"\s*:\s*"([^"]+)"')
 NAME_SET = re.compile(r'(?i)^\s*set (first-name|last-name|fullname|full-name|display-name|contact|company) (".*?"|\S+)')
 USER_CMD = re.compile(r'(?i)^\s*(?:no\s+)?(?:username|user name|users passwd|local-user)\s+("[^"]+"|\S+)')
 GENERIC_ACCOUNTS = {'admin', 'administrator', 'root', 'guest', 'operator', 'support', 'user', 'users', 'monitor',
@@ -496,7 +768,8 @@ GENERIC_ACCOUNTS = {'admin', 'administrator', 'root', 'guest', 'operator', 'supp
                     'name', 'group', 'none', 'all', 'any'}
 NAME_STOP = {'none', 'null', 'true', 'false', 'default', 'admin', 'user', 'test', 'name', 'unknown', 'reception',
              'centralino', 'ufficio', 'office', 'fax', 'voicemail', 'queue', 'ivr', 'operator', 'operatore',
-             'redacted'}
+             'redacted', 'asterisk', 'freepbx', 'device', 'devices', 'extension', 'trunk', 'sip', 'pjsip', 'iax',
+             'iax2', 'dahdi', 'mobile', 'cell', 'home', 'work', 'main', 'general', 'anonymous', 'unavailable'}
 WORD = re.compile(r"[A-Za-z0-9\u00c0-\u024f][\w.'\u00c0-\u024f-]*")
 
 # Identities (level 2): hostnames, domains, IP and MAC addresses, user-supplied words.
@@ -652,6 +925,7 @@ class Privacy:
                     self.keywords.add(t[1].lower())
 
     def add_name(self, value):
+        value = re.sub(r'<[^<>]*>', ' ', value)
         for w in re.split(r'[\s,;/()]+', value.strip().strip('"\'')):
             w = w.strip(".-'\"")
             if len(w) >= 3 and not w.isdigit() and w.lower() not in NAME_STOP and w.lower() not in self.keywords:
@@ -663,10 +937,42 @@ class Privacy:
                 and v.lower() not in self.keywords:
             self.token('USER', v)
 
+    SQL_NAME_COLS = {'fname', 'lname', 'displayname', 'display_name', 'callerid', 'cid_name', 'outboundcid', 'fullname'}
+    SQL_NAME_TABLES = {'users', 'devices', 'userman_users', 'extensions', 'sip', 'pjsip', 'iax'}
+    SQL_USER_COLS = {'username', 'fromuser', 'user_name', 'auth_username'}
+    NAME_KEYWORDS = {'callerid', 'cid_name', 'description', 'displayname', 'fullname', 'outboundcid'}
+
+    def collect_sql(self, text):
+        for table, cols, values in iter_sql_rows(text):
+            kw = next((k for k, c in enumerate(cols) if c in KW_NAMES), None)
+            val = next((k for k, c in enumerate(cols) if c in VAL_NAMES), None)
+            for k, col in enumerate(cols):
+                if k >= len(values) or values[k] is None:
+                    continue
+                if col in self.SQL_NAME_COLS or (col in ('name', 'description') and table in self.SQL_NAME_TABLES):
+                    self.add_name(values[k])
+                elif col in self.SQL_USER_COLS:
+                    self.add_user(values[k])
+            if kw is not None and val is not None and kw < len(values) and val < len(values) and values[kw] \
+                    and values[kw].lower() in self.NAME_KEYWORDS and values[val]:
+                self.add_name(values[val])
+
     def collect(self, text):
         self.learn_keywords(text)
+        if re.search(r'(?im)^\s*(?:CREATE\s+(?:TEMPORARY\s+)?TABLE|(?:INSERT|REPLACE)\s+(?:IGNORE\s+)?INTO|COPY\s+\S+.*FROM\s+stdin)', text):
+            self.collect_sql(text)
         forti, ros = [], ''
+        since_extension = since_tech = 99
         for line in text.splitlines():
+            # FreePBX module data: {"extension": "101", ..., "name": "John Smith"} and devices with "description".
+            since_extension = 0 if re.search(r'"extension"\s*:\s*"\d+"', line) else since_extension + 1
+            since_tech = 0 if re.search(r'"(?:tech|devicetype)"\s*:\s*"', line) else since_tech + 1
+            m = re.search(r'"name"\s*:\s*"([^"]+)"', line)
+            if m and since_extension <= 3:
+                self.add_name(m.group(1))
+            m = re.search(r'"description"\s*:\s*"([^"]+)"', line)
+            if m and since_tech <= 6:
+                self.add_name(m.group(1))
             s = line.strip()
             m = re.match(r'^config\s+(.+?)\s*$', s)
             if m:
@@ -691,6 +997,19 @@ class Privacy:
             m = USER_CMD.match(line)
             if m:
                 self.add_user(m.group(1))
+            m = AST_USER.match(line)
+            if m:
+                self.add_user(m.group(1))
+            for m in USER_KEYS.finditer(line):
+                self.add_user(m.group(1))
+            m = AST_CALLERID.match(line)
+            if m:
+                self.add_name(m.group(1).split(';')[0])
+            m = VM_NAME_ENTRY.match(line)
+            if m:
+                fields = line.split('=>', 1)[1].split(',')
+                if len(fields) > 1:
+                    self.add_name(fields[1])
             m = HOST_CMD.match(line)
             if m:
                 self.add_host(m.group(1))
@@ -720,6 +1039,11 @@ class Privacy:
         counts = {k: 0 for k in self.KINDS}
 
         def email(m):
+            before = m.string[max(0, m.start() - 60):m.start()]
+            # user:REDACTED@host and user:secret:authuser@host are credentials, not addresses.
+            if m.group().split('@')[0].lower() == 'redacted' or (
+                    before.endswith(':') and re.search(r'(?i)register\s*=>|://|[A-Z0-9]+/\S*$', before)):
+                return m.group()
             counts['EMAIL'] += 1
             return self.token('EMAIL', m.group().lower())
 
@@ -914,6 +1238,7 @@ def redact_multipart(raw, privacy=None):
 
 
 MAX_ENTRY_SIZE = 512 * 1024 * 1024  # refuse suspiciously large archive members
+GZ_LIMIT = 256 * 1024 * 1024        # largest gzip content expanded in memory
 OUTPUT_MARKERS = ('_SANITIZED', '_ANONYMIZED', '_NO-SECRETS-FOUND', 'PERSONAL-DATA-MAP')
 STDIO = '-'
 
@@ -950,6 +1275,81 @@ def unique_path(folder, name, suffix):
     if dst.exists():
         dst = folder / (name + '_' + datetime.now().strftime('%Y%m%d-%H%M%S') + suffix)
     return dst
+
+
+class Member:
+    """One file inside an archive: name, size and a function that reads its bytes."""
+
+    def __init__(self, name, size, read):
+        self.name, self.size, self.read = name.replace('\\', '/'), size, read
+
+
+def read_member(member):
+    if member.size > MAX_ENTRY_SIZE:
+        raise ValueError('The file inside the archive is too large to process safely.')
+    return member.read()
+
+
+def gunzip(fileobj, limit=GZ_LIMIT):
+    try:
+        with gzip.GzipFile(fileobj=fileobj) as g:
+            data = g.read(limit + 1)
+    except (OSError, EOFError):
+        raise ValueError('The gzip data is damaged or not really gzip.')
+    if len(data) > limit:
+        raise ValueError('The compressed file is too large to process safely.')
+    return data
+
+
+def safe_relative(name):
+    """Path inside the output folder: no absolute parts, no '..', or None when nothing is left."""
+    parts = [p for p in name.replace('\\', '/').split('/') if p not in ('', '.', '..')]
+    return Path(*parts) if parts else None
+
+
+def archive_stem(src):
+    stem = src.stem
+    if stem.lower().endswith('.tar'):
+        stem = stem[:-4]
+    return stem
+
+
+AUDIO_EXT = {'.wav', '.alaw', '.ulaw', '.g722', '.g729', '.gsm', '.sln', '.sln16', '.sln48', '.mp3', '.ogg', '.opus',
+             '.wma', '.m4a', '.aac', '.flac'}
+BINARY_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.pdf', '.so', '.dll', '.exe', '.bin', '.pyc',
+              '.woff', '.woff2', '.ttf', '.eot', '.db', '.sqlite', '.sqlite3', '.rrd', '.tdb', '.mp4', '.mov'}
+
+
+def archive_policy(members):
+    """(label, skip_reason) for an archive: skip_reason(name) returns None for files to process."""
+    names = [m.name for m in members]
+
+    def generic(name):
+        ext = Path(name).suffix.lower()
+        if ext in AUDIO_EXT:
+            return 'audio files'
+        if ext in BINARY_EXT:
+            return 'binary files'
+        return None
+
+    if any('/' not in n and re.fullmatch(r'\d*Db\.xml', n) for n in names):
+        # 3CX backup: database tables, recordings, voicemail, prompts, certificates and phone
+        # provisioning files are never written out; only the configuration is sanitized.
+        def three_cx(name):
+            if '/' not in name and re.fullmatch(r'\d*Db\.xml', name):
+                return None
+            return name.split('/')[0] if '/' in name else 'other files at the root'
+        return '3CX backup. Only the configuration file is processed.', three_cx
+    if any(n.startswith('modulejson/') for n in names) or any('/etc/asterisk/' in n for n in names):
+        # FreePBX backup: call records (CDR/CEL), audio and voicemail are never written out.
+        def freepbx(name):
+            if '/cdr_dump/' in name or '/cel_dump/' in name:
+                return 'call records (CDR/CEL)'
+            if '/var/lib/asterisk/moh/' in name or '/var/lib/asterisk/sounds/' in name or '/var/spool/asterisk/' in name:
+                return 'audio and voicemail'
+            return generic(name)
+        return 'FreePBX / Asterisk backup. Configuration, module data and SQL dumps are processed.', freepbx
+    return None, generic
 
 
 class Run:
@@ -1042,68 +1442,143 @@ class Run:
         self.report(dst, result)
         self.sources.append(label)
 
+    # ---------------------------------------------------------------- archives
     def handle_zip(self, src, rel_parent):
-        self.say('File:', src.name, '(ZIP archive, read in memory)')
         try:
             archive = zipfile.ZipFile(src)
         except zipfile.BadZipFile:
             raise ValueError('The ZIP archive is damaged or not a real ZIP file.')
         with archive:
-            members = [i for i in archive.infolist() if not i.is_dir()]
-            if not members:
-                raise ValueError('The ZIP archive contains no files.')
-            if any(i.flag_bits & 0x1 for i in members):
+            infos = [i for i in archive.infolist() if not i.is_dir()]
+            if any(i.flag_bits & 0x1 for i in infos):
                 raise ValueError('The ZIP archive is password protected: extract it manually first.')
-            zip_stem = Path(src.stem)  # "backup.conf.zip" -> "backup.conf"
-            db = [i for i in members if re.fullmatch(r'\d*Db\.xml', i.filename)]
-            if db:
-                # 3CX backup: only the configuration is sanitized. Database tables, recordings,
-                # voicemail, prompts, certificates and phone provisioning files are never written out.
-                self.say('Likely content: 3CX backup. Only the configuration file is processed.')
-                skipped = {}
-                for i in members:
-                    if i in db:
-                        continue
-                    top = i.filename.split('/')[0] if '/' in i.filename else '(root)'
-                    n, size = skipped.get(top, (0, 0))
-                    skipped[top] = (n + 1, size + i.file_size)
-                for top, (n, size) in sorted(skipped.items()):
-                    self.say('  Skipped: %-20s %5d files %10.1f MB' % (top, n, size / 1048576))
-                members = db
-            if (self.to_stdout or self.explicit_file is not None) and len(members) > 1:
-                raise ValueError('A single output works with a single file: this archive holds %d.' % len(members))
-            for info in members:
-                # Only the base name is used, never the path stored in the archive.
-                inner = Path(info.filename.replace('\\', '/').split('/')[-1])
-                self.say()
-                label = '%s -> %s' % (src.name, info.filename)
-                try:
-                    if info.file_size > MAX_ENTRY_SIZE:
-                        raise ValueError('The file inside the archive is too large to process safely.')
-                    if len(members) == 1:
-                        stem, suffix = zip_stem.stem, zip_stem.suffix or inner.suffix
-                    else:
-                        stem, suffix = zip_stem.stem + '__' + inner.stem, inner.suffix
-                    self.handle_bytes(archive.read(info), src, rel_parent, stem, suffix, label)
-                except ValueError as exc:
-                    self.failed += 1
-                    self.say('Operation not completed:', exc)
-                except Exception as exc:
-                    self.failed += 1
-                    self.say('Operation not completed (' + type(exc).__name__ + ').')
+            members = [Member(i.filename, i.file_size, lambda i=i: archive.read(i)) for i in infos]
+            self.handle_archive(src, rel_parent, members, 'ZIP archive')
+
+    def handle_tar(self, src, rel_parent, fileobj=None):
+        try:
+            archive = tarfile.open(src if fileobj is None else None, 'r:*', fileobj=fileobj)
+        except (tarfile.TarError, EOFError):
+            raise ValueError('The TAR archive is damaged or not a real TAR file.')
+        with archive:
+            members = [Member(i.name, i.size, lambda i=i: archive.extractfile(i).read())
+                       for i in archive.getmembers() if i.isfile()]
+            self.handle_archive(src, rel_parent, members, 'TAR archive')
+
+    def handle_gzip(self, src, rel_parent):
+        with src.open('rb') as f:
+            raw = gunzip(f)
+        if raw[257:262] == b'ustar' or src.name.lower().endswith(('.tar.gz', '.tgz')):
+            return self.handle_tar(src, rel_parent, fileobj=io.BytesIO(raw))
+        inner = Path(src.stem)  # "running.conf.gz" -> "running.conf"
+        self.handle_bytes(raw, src, rel_parent, inner.stem, inner.suffix or '.txt', src.name + ' (gzip, read in memory)')
+
+    def handle_archive(self, src, rel_parent, members, kind):
+        self.say('File:', src.name, '(%s, read in memory)' % kind)
+        if not members:
+            raise ValueError('The archive contains no files.')
+        label, skip_reason = archive_policy(members)
+        if label:
+            self.say('Likely content:', label)
+        kept, skipped = [], {}
+        for m in members:
+            reason = skip_reason(m.name)
+            if reason is None and safe_relative(m.name) is None:
+                reason = 'unsafe path'
+            if reason is None:
+                kept.append(m)
+            else:
+                n, size = skipped.get(reason, (0, 0))
+                skipped[reason] = (n + 1, size + m.size)
+        for reason, (n, size) in sorted(skipped.items()):
+            self.say('  Skipped: %-28s %5d file(s) %10.1f MB' % (reason, n, size / 1048576))
+        if not kept:
+            raise ValueError('The archive holds no text files to process.')
+        stem = archive_stem(src)
+        if len(kept) == 1:
+            # One file: the copy is named after the archive ("backup.conf.zip" -> "backup_SANITIZED.conf").
+            inner = Path(kept[0].name.split('/')[-1])
+            suffix = Path(stem).suffix or inner.suffix
+            stem = Path(stem).stem if Path(stem).suffix else stem
+            self.say()
+            self.handle_bytes(read_member(kept[0]), src, rel_parent, stem, suffix, '%s -> %s' % (src.name, kept[0].name))
+            return
+        if self.to_stdout or self.explicit_file is not None:
+            raise ValueError('A single output works with a single file: this archive holds %d.' % len(kept))
+        self.handle_archive_folder(src, rel_parent, kept, stem)
+
+    def handle_archive_folder(self, src, rel_parent, kept, stem):
+        """Several files inside one archive: a folder with the same tree, one sanitized copy per file."""
+        results, unreadable = [], {}
+        for m in kept:
+            rel = safe_relative(m.name)
+            try:
+                raw = read_member(m)
+                if rel.suffix.lower() == '.gz':
+                    raw, rel = gunzip(io.BytesIO(raw)), rel.with_suffix('')
+                results.append((rel, sanitize_bytes(raw, self.privacy)))
+            except ValueError as exc:
+                key = str(exc).split(':')[0].rstrip('.')
+                n, size = unreadable.get(key, (0, 0))
+                unreadable[key] = (n + 1, size + m.size)
+        for reason, (n, size) in sorted(unreadable.items()):
+            self.say('  Skipped: %-28s %5d file(s) %10.1f MB' % (reason, n, size / 1048576))
+        if not results:
+            raise ValueError('The archive holds no text files to process.')
+        any_change = any(r.changed or r.personal_hits for _, r in results)
+        tag = ('_ANONYMIZED' if self.args.personal else '_SANITIZED') if any_change else '_NO-SECRETS-FOUND'
+        base = self.output_dir / rel_parent if self.output_dir is not None else src.parent
+        base.mkdir(parents=True, exist_ok=True)
+        folder = unique_path(base, stem, tag)
+        folder.mkdir()
+        self.say('Folder created:', folder.name, '(%d files, same tree as the archive)' % len(results))
+        untouched = []
+        for rel, result in results:
+            dst = folder / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            with dst.open('xb') as f:
+                f.write(result.data)
+            self.outputs.append(dst)
+            self.written += 1
+            if result.changed or result.personal_hits:
+                extra = ''
+                if self.privacy is not None and result.personal_hits:
+                    extra += ', %d personal value(s)' % result.personal_hits
+                if result.review:
+                    shown = ', '.join(map(str, result.review[:20]))
+                    extra += '; review lines ' + shown + (' ...' if len(result.review) > 20 else '')
+                    self.flagged += len(result.review)
+                self.say('  %s: %d line(s) masked%s' % (rel.as_posix(), len(result.changed), extra))
+            else:
+                untouched.append(rel.as_posix())
+                if result.review:
+                    self.flagged += len(result.review)
+                    self.say('  %s: nothing masked; review lines %s' % (rel.as_posix(), ', '.join(map(str, result.review[:20]))))
+        if untouched:
+            self.say('  %d file(s) copied unchanged (nothing to mask): %s%s'
+                     % (len(untouched), ', '.join(untouched[:8]), ' ...' if len(untouched) > 8 else ''))
+        self.sources.append(src.name)
+        if not any_change:
+            self.no_secrets += 1
+            self.say('WARNING: no secrets found in the whole archive. Check that it holds configuration')
+            self.say('files whose syntax is supported, and review the copies before sharing them.')
 
     def handle_file(self, src, rel_parent=Path('.')):
         with src.open('rb') as f:
-            head = f.read(4)
+            head = f.read(512)
         if head[:2] == b'PK' and zipfile.is_zipfile(src):
             return self.handle_zip(src, rel_parent)
+        if head[:2] == b'\x1f\x8b':
+            return self.handle_gzip(src, rel_parent)
+        if head[257:262] == b'ustar' or (src.suffix.lower() == '.tar' and tarfile.is_tarfile(src)):
+            return self.handle_tar(src, rel_parent)
         self.handle_bytes(src.read_bytes(), src, rel_parent, src.stem, src.suffix, src.name)
 
     def handle_directory(self, root):
         count = 0
         for p in sorted(p for p in root.rglob('*') if p.is_file()):
             rel = p.relative_to(root)
-            if any(part.startswith('.') for part in rel.parts) or is_own_output(p.name):
+            if any(part.startswith('.') or is_own_output(part) for part in rel.parts):
                 continue
             count += 1
             self.say()
@@ -1185,7 +1660,7 @@ def build_parser():
     parser = argparse.ArgumentParser(prog='netblur', description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('input', nargs='+', metavar='INPUT',
-                        help='configuration file, ZIP archive, directory, or - for standard input')
+                        help='configuration file, archive (zip, tar, tar.gz, gz), directory, or - for standard input')
     parser.add_argument('-o', '--output', metavar='PATH',
                         help='output file (single input, with an extension) or directory; - for standard output')
     parser.add_argument('-p', '--personal', action='store_true',

@@ -13,9 +13,11 @@ Pasting a firewall config into a chat is one of the fastest ways to troubleshoot
 | Family | Examples |
 | --- | --- |
 | CLI keyword followed by a value | Cisco IOS and ASA, Zyxel, Fortinet (FortiGate, FortiWeb, FortiSwitch), Extreme EXOS and VOSS, Netgear, TP-Link, Huawei, Aruba, Ubiquiti EdgeOS, Juniper |
-| key=value | MikroTik RouterOS, Ubiquiti airOS `system.cfg`, WireGuard |
-| JSON | UniFi |
+| key=value and key => value | MikroTik RouterOS, Ubiquiti airOS `system.cfg`, WireGuard, Asterisk (`sip.conf`, `pjsip.conf`, `iax.conf`, `manager.conf`, `ari.conf`...) |
+| Asterisk specifics | `register =>` lines, `Dial(SIP/user:secret@host)` strings, voicemail PINs in `voicemail.conf`, `Set(DB(.../password)=...)`, bare values under a `[secret]` section |
+| JSON | UniFi, FreePBX module data (`modulejson/*.json`, including keyword/data rows) |
 | XML | WatchGuard, pfSense, OPNsense, 3CX `Db.xml` |
+| SQL dumps | MySQL/MariaDB `INSERT` rows and PostgreSQL `COPY` blocks: secret columns are found through `CREATE TABLE`, keyword/data tables (FreePBX `sip`, `pjsip`, `iax`) through the keyword name |
 | Private keys | PEM blocks and OpenVPN static keys, including multi-line FortiGate `set private-key` values |
 | Hashes and ciphertexts | `$1$`, `$5$`, `$6$`, `$8$`, `$9$`, Huawei `%^%#`, anything after Fortinet `ENC` |
 | Embedded credentials | `user:password@host` in URLs and in Fortinet backup or automation scripts |
@@ -23,12 +25,13 @@ Pasting a firewall config into a chat is one of the fastest ways to troubleshoot
 
 It also handles:
 
-- **ZIP archives**: every file inside is read in memory and only sanitized copies are written to disk. Paths stored in the archive are ignored, so nothing is ever written outside the output folder.
+- **ZIP, TAR and gzip archives** (`.zip`, `.tar`, `.tar.gz`, `.tgz`, `.gz`): read in memory, only sanitized copies reach the disk. One file inside gives one copy named after the archive; several files give a folder with the same tree (`backup_SANITIZED/...`). Audio and binary files are skipped and counted, nested `.gz` members are expanded in memory, and `..` or absolute paths stored in the archive are stripped, so nothing is ever written outside the output folder.
 - **Fortinet multi-part backups** (for example a FortiWeb "entire configuration"): text blocks are sanitized, encrypted or compressed blocks are omitted and listed in the report.
 - **3CX backups**: only the configuration file `<number>Db.xml` is processed. Database tables, recordings, voicemail, prompts, certificates and phone provisioning files are skipped and never written out.
+- **FreePBX backups** (`.tar.gz`): module data, Asterisk configuration files and SQL dumps are processed; call records (CDR/CEL), music on hold, recordings and voicemail are never written out. Private keys under `etc/asterisk/keys` are replaced, certificates kept.
 - **Directories**: processed recursively, mirroring the structure in the output folder. Files that are not text are skipped and reported.
 
-Public certificates (`BEGIN CERTIFICATE`) are left untouched.
+Public certificates and public keys (`BEGIN CERTIFICATE`, `BEGIN PUBLIC KEY`) are left untouched.
 
 ### Two levels
 
@@ -60,6 +63,7 @@ Or just copy `netblur.py` anywhere and run it with `python netblur.py`. On Windo
 ```
 netblur startup-config.conf
 netblur --personal 3CXScheduledBackup.zip
+netblur freepbx-backup.tar.gz
 netblur config1.conf config2.cfg backup.zip
 netblur backups/ -o clean/
 cat running-config.txt | netblur - -o - > clean.txt
@@ -71,7 +75,7 @@ netblur config.conf -o out/ --strict
 | Option | Effect |
 | --- | --- |
 | `-o PATH` | Output file (single input, with an extension) or directory (a path without extension, with a trailing slash, or with several inputs). `-` writes to standard output and sends the report to standard error |
-| `-p`, `--personal` | Level 2: also replace names, usernames, emails, phones, hostnames, domains, public IPs, MACs |
+| `-p`, `--personal` | Level 2: also replace names, usernames, emails, phones, hostnames, domains, public IPs, MACs (for Asterisk and FreePBX: caller ID names, voicemail names, SIP account names) |
 | `-w WORD`, `--words-file FILE` | Level 2: sensitive words to replace wherever they appear (repeat `-w` or separate with commas) |
 | `--all-ips`, `--keep-ips`, `--keep-macs` | Level 2: replace private addresses too, or keep every IP or MAC as it is |
 | `-m FILE` | Where to write the JSON map of placeholders (default: next to the copies) |
@@ -101,7 +105,7 @@ Read these before relying on the output.
 - This is a conservative, pattern-based tool, not a parser. It recognises secrets from the shape of each line, and new firmware or unusual syntax can slip through. **Always review the copy before sharing it**, starting from the lines flagged in the report.
 - When in doubt it masks, so some harmless values may be masked too.
 - At level 2, names are recognised in the fields that hold them (`FirstName`, `username`, SNMP contact and similar), hostnames and domains in the commands that set them. A name written only inside free text can remain visible: pass it with `-w`. Replaced addresses keep no subnet relationship with each other, and interface descriptions are kept (scrubbed of what the tool recognises) rather than blanked.
-- Fully binary or encrypted backups (for example UniFi `.unf`, encrypted WatchGuard backups, many router `.cfg` and `.bin` files) are rejected: export the configuration as text. Password-protected ZIP files must be extracted first.
+- Fully binary or encrypted backups (for example UniFi `.unf`, encrypted WatchGuard backups, many router `.cfg` and `.bin` files) are rejected: export the configuration as text. Password-protected ZIP files must be extracted first. Archives are expanded in memory, so very large members are refused rather than processed.
 - The sanitized copy cannot be restored onto a device.
 
 ### Tests

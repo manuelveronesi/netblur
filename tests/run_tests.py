@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -354,11 +355,70 @@ def test_identities(tmp):
     check('restore: refuses to run without a map', code == 1)
 
 
+def test_gui(tmp):
+    work = tmp / 'gui'
+    work.mkdir()
+    shutil.copy(SAMPLES / 'cisco.conf', work)
+    code, out = run([], work)
+    check('gui: no input without --gui is a usage error', code == 2 and 'INPUT' in out)
+    env = dict(os.environ, NETBLUR_GUI_AUTOCLOSE='1')
+    try:
+        p = subprocess.run([sys.executable, '-I', str(SCRIPT), '--gui', 'cisco.conf', '--personal', '--no-map', '-o', 'out'],
+                           cwd=str(work), env=env, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        check('gui: window processes its inputs and closes', False, 'timeout')
+        return
+    if p.returncode == 3:
+        print('SKIP  gui: no tkinter or no display here (' + p.stderr.strip()[:80] + ')')
+        return
+    copy = work / 'out' / 'cisco_ANONYMIZED.conf'
+    check('gui: window processes its inputs and closes', p.returncode == 0 and copy.exists() and 'LEAK' not in text(copy),
+          'code %s %s' % (p.returncode, p.stderr[-300:]))
+    p = subprocess.run([sys.executable, '-I', str(SCRIPT), '--gui'], cwd=str(work), env=env, capture_output=True, timeout=120)
+    check('gui: opens with no inputs', p.returncode == 0)
+
+
+def test_menu(tmp):
+    if os.name == 'nt' or not shutil.which('sh'):
+        print('SKIP  menu: install-menu.sh is for macOS and Linux')
+        return
+    home = tmp / "menu home"
+    work = home / "it's my folder"
+    work.mkdir(parents=True)
+    shutil.copy(SAMPLES / 'cisco.conf', work)
+    env = dict(os.environ, HOME=str(home), NETBLUR_MENU_NO_WINDOW='1')
+    env.pop('XDG_DATA_HOME', None)
+    env.pop('XDG_CONFIG_HOME', None)
+    p = subprocess.run(['sh', str(ROOT / 'install-menu.sh')], env=env, capture_output=True, text=True)
+    check('menu: installer runs', p.returncode == 0, p.stdout[-300:] + p.stderr[-300:])
+    name = 'netblur (secrets and personal data)'
+    if sys.platform == 'darwin':
+        bundle = home / 'Library' / 'Services' / (name + '.workflow') / 'Contents'
+        lint = subprocess.run(['plutil', '-lint', str(bundle / 'Info.plist'), str(bundle / 'document.wflow')],
+                              capture_output=True, text=True)
+        check('menu: Quick Action files are valid property lists', lint.returncode == 0, lint.stdout[-300:])
+        try:
+            p = subprocess.run(['automator', '-i', str(work / 'cisco.conf'), str(bundle.parent)], env=env,
+                               capture_output=True, text=True, timeout=120)
+            detail = 'code %s %s %s' % (p.returncode, p.stdout[-200:], p.stderr[-300:])
+        except subprocess.TimeoutExpired:
+            detail = 'timeout'
+        check('menu: Quick Action runs through Automator', (work / 'cisco_ANONYMIZED.conf').exists(), detail)
+    else:
+        script = home / '.local' / 'share' / 'nautilus' / 'scripts' / name
+        p = subprocess.run([str(script), str(work / 'cisco.conf')], env=env, capture_output=True, text=True)
+        check('menu: file manager script sanitizes the selected file', (work / 'cisco_ANONYMIZED.conf').exists(),
+              p.stdout[-200:] + p.stderr[-300:])
+    p = subprocess.run(['sh', str(ROOT / 'install-menu.sh'), '--remove'], env=env, capture_output=True, text=True)
+    left = [q for q in home.rglob('*') if q.is_file() and work not in q.parents]
+    check('menu: --remove leaves nothing behind', p.returncode == 0 and not left, str(left)[:300])
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='netblur-tests-'))
     try:
         for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_freepbx,
-                     test_cli, test_identities):
+                     test_cli, test_identities, test_gui, test_menu):
             print('--- ' + test.__name__)
             test(tmp)
     finally:

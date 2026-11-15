@@ -28,6 +28,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-      - run: python tests/run_tests.py
+      - name: Tests
+        shell: bash
+        run: |
+          # On Linux a virtual display lets the window test run too.
+          if command -v xvfb-run >/dev/null 2>&1; then
+            xvfb-run -a python tests/run_tests.py
+          else
+            python tests/run_tests.py
+          fi
       - run: pip install .
       - run: netblur --version

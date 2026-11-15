@@ -1,5 +1,10 @@
 ### Changelog
 
+### 3.3
+- `--gui`: a small window to choose files and folders, the level, sensitive words and the output folder, and to read the report
+- `install-menu.sh`: right-click entries on macOS (Finder Quick Actions) and Linux (GNOME Files, Nemo, Caja scripts, Dolphin service menu), with `--remove`
+- Tests for the window and the menu installer; on Linux the suite runs under a virtual display
+
 ### 3.2
 - Asterisk and FreePBX: `key => value` syntax, `register =>` credentials, `Dial(SIP/user:secret@host)` strings, voicemail PINs, dialplan `Set(...password...)=`, `[secret]` sections, `AMPMGRPASS`/`AMPDBPASS` and similar compound names
 - FreePBX module data (JSON): keyword/data rows masked by keyword name, also across lines

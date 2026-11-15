@@ -30,7 +30,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '3.2'
+VERSION = '3.3'
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s]+')
 
@@ -1659,7 +1659,7 @@ def resolve_output(args, run):
 def build_parser():
     parser = argparse.ArgumentParser(prog='netblur', description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('input', nargs='+', metavar='INPUT',
+    parser.add_argument('input', nargs='*', metavar='INPUT',
                         help='configuration file, archive (zip, tar, tar.gz, gz), directory, or - for standard input')
     parser.add_argument('-o', '--output', metavar='PATH',
                         help='output file (single input, with an extension) or directory; - for standard output')
@@ -1682,6 +1682,9 @@ def build_parser():
                         help='exit with status 2 when lines are flagged for review or a file had no secrets')
     parser.add_argument('--force', action='store_true',
                         help='allow overwriting the file named by -o or -m (never the originals)')
+    parser.add_argument('--gui', action='store_true',
+                        help='open a small window to choose files and read the report (needs tkinter); '
+                             'inputs given on the command line are processed at once')
     parser.add_argument('--version', action='version', version='netblur ' + VERSION)
     return parser
 
@@ -1761,13 +1764,198 @@ def restore_main(args):
     return 1 if failed else 0
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+GUI_UNAVAILABLE = 3  # exit status of --gui when tkinter or a display is missing
+
+
+def gui_main(args):
+    """A small window: choose files or folders, pick the level, read the report. Nothing else changes."""
+    import contextlib
+    import os
+    import queue
+    import subprocess
+    import threading
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        from tkinter.scrolledtext import ScrolledText
+        root = tk.Tk()
+    except Exception:  # no tkinter, or no display to open a window on
+        print('The window needs Python with tkinter and a graphical session. Use the command line instead.',
+              file=sys.stderr)
+        return GUI_UNAVAILABLE
+
+    autoclose = bool(os.environ.get('NETBLUR_GUI_AUTOCLOSE'))  # used by the tests
+    state = {'code': 0, 'running': False, 'outputs': [], 'out_dir': args.output}
+    lines = queue.Queue()
+    root.title('netblur ' + VERSION)
+    root.minsize(640, 420)
+
+    top = tk.Frame(root, padx=10, pady=8)
+    top.pack(fill='x')
+    inputs = tk.Listbox(top, height=4, selectmode='extended')
+    inputs.pack(side='left', fill='x', expand=True)
+    for item in args.input:
+        inputs.insert('end', item)
+    buttons = tk.Frame(top)
+    buttons.pack(side='left', padx=(8, 0))
+
+    def add_files():
+        for name in filedialog.askopenfilenames(title='Configuration files or archives'):
+            inputs.insert('end', name)
+
+    def add_folder():
+        name = filedialog.askdirectory(title='Folder with configuration files')
+        if name:
+            inputs.insert('end', name)
+
+    def remove_selected():
+        for index in reversed(inputs.curselection() or range(inputs.size())):
+            inputs.delete(index)
+
+    tk.Button(buttons, text='Add files...', width=14, command=add_files).pack(pady=1)
+    tk.Button(buttons, text='Add folder...', width=14, command=add_folder).pack(pady=1)
+    tk.Button(buttons, text='Remove', width=14, command=remove_selected).pack(pady=1)
+
+    options = tk.Frame(root, padx=10)
+    options.pack(fill='x')
+    level = tk.IntVar(value=2 if args.personal else 1)
+    tk.Radiobutton(options, text='Secrets only', variable=level, value=1).grid(row=0, column=0, sticky='w')
+    tk.Radiobutton(options, text='Secrets and personal data', variable=level, value=2).grid(row=0, column=1, sticky='w')
+    tk.Label(options, text='Sensitive words (level 2, comma separated):').grid(row=1, column=0, sticky='w')
+    words = tk.Entry(options, width=40)
+    words.insert(0, ','.join(args.words or []))
+    words.grid(row=1, column=1, sticky='we')
+    out_label = tk.StringVar()
+
+    def show_out_dir():
+        out_label.set('Copies go to: ' + (state['out_dir'] or 'the folder of each original'))
+
+    def choose_out_dir():
+        name = filedialog.askdirectory(title='Folder for the copies')
+        state['out_dir'] = name or None
+        show_out_dir()
+
+    show_out_dir()
+    tk.Label(options, textvariable=out_label, anchor='w').grid(row=2, column=0, columnspan=2, sticky='w')
+    tk.Button(options, text='Change...', command=choose_out_dir).grid(row=2, column=2, padx=(8, 0))
+    options.columnconfigure(1, weight=1)
+
+    actions = tk.Frame(root, padx=10, pady=8)
+    actions.pack(fill='x')
+    run_button = tk.Button(actions, text='Run', width=14)
+    run_button.pack(side='left')
+    open_button = tk.Button(actions, text='Open output folder', state='disabled')
+    open_button.pack(side='left', padx=8)
+    tk.Label(actions, text='Originals are never modified.').pack(side='right')
+
+    report = ScrolledText(root, height=14, state='disabled', wrap='word')
+    report.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+
+    class Writer:
+        def write(self, text):
+            lines.put(text)
+
+        def flush(self):
+            pass
+
+    def work(argv):
+        collected = []
+        try:
+            with contextlib.redirect_stdout(Writer()), contextlib.redirect_stderr(Writer()):
+                state['code'] = main(argv, collected)
+        except SystemExit as exc:  # argparse errors
+            state['code'] = exc.code if isinstance(exc.code, int) else 1
+        except Exception as exc:
+            state['code'] = 1
+            lines.put('Operation not completed (' + type(exc).__name__ + ').\n')
+        state['outputs'] = list(collected[0]) if collected else []
+        lines.put(None)
+
+    def start():
+        if state['running'] or not inputs.size():
+            return
+        argv = list(inputs.get(0, 'end'))
+        if level.get() == 2:
+            argv.append('--personal')
+            if words.get().strip():
+                argv += ['--words', words.get().strip()]
+        if state['out_dir']:
+            argv += ['--output', state['out_dir'] + os.sep]
+        if args.no_map:
+            argv.append('--no-map')
+        state['running'] = True
+        run_button.config(state='disabled')
+        open_button.config(state='disabled')
+        report.config(state='normal')
+        report.delete('1.0', 'end')
+        report.config(state='disabled')
+        threading.Thread(target=work, args=(argv,), daemon=True).start()
+
+    def open_folder():
+        if not state['outputs']:
+            return
+        first = Path(state['outputs'][0])
+        folder = str(Path(state['out_dir']) if state['out_dir'] else first.parent)
+        try:
+            if sys.platform == 'win32':
+                os.startfile(folder)
+            else:
+                subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', folder])
+        except OSError:
+            pass
+
+    def pump():
+        finished = False
+        chunks = []
+        while True:
+            try:
+                item = lines.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                finished = True
+            else:
+                chunks.append(item)
+        if chunks:
+            report.config(state='normal')
+            report.insert('end', ''.join(chunks))
+            report.see('end')
+            report.config(state='disabled')
+        if finished:
+            state['running'] = False
+            run_button.config(state='normal')
+            if state['outputs']:
+                open_button.config(state='normal')
+            if autoclose:
+                root.destroy()
+                return
+        root.after(100, pump)
+
+    run_button.config(command=start)
+    open_button.config(command=open_folder)
+    root.after(100, pump)
+    if args.input:
+        root.after(200, start)
+    elif autoclose:
+        root.after(300, root.destroy)
+    root.mainloop()
+    return state['code'] if autoclose else 0
+
+
+def main(argv=None, outputs=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.words:
         args.words = [w for item in args.words for w in item.split(',')]
+    if args.gui:
+        return gui_main(args)
+    if not args.input:
+        parser.error('the following arguments are required: INPUT')
     if args.restore:
         return restore_main(args)
     run = Run(args)
+    if outputs is not None:
+        outputs.append(run.outputs)  # the list fills up while the run proceeds
     run.say('netblur', VERSION, '| level 2: secrets and personal data' if args.personal else '| level 1: secrets only')
     if run.to_stdout and len(args.input) > 1:
         run.say('Standard output works with a single input.')

@@ -81,22 +81,43 @@ netblur config.conf -o out/ --strict
 | `-m FILE` | Where to write the JSON map of placeholders (default: next to the copies) |
 | `--no-map` | Do not write the map file |
 | `--restore` | Put the real values back into a text using the map given with `-m` (output: `_RESTORED` copy, or `-o`) |
+| `--gui` | Open the window instead of printing to the terminal (exit status 3 when tkinter or a display is missing) |
 | `--strict` | Exit with status 2 when lines are flagged for review or a file had no secrets (useful in scripts and CI) |
 | `--force` | Allow overwriting the file named by `-o` or `-m`, never the originals |
 
-Exit codes: 0 success, 1 an input could not be processed, 2 `--strict` findings.
+Exit codes: 0 success, 1 an input could not be processed, 2 `--strict` findings or wrong usage, 3 `--gui` not available.
 
 The report shows the likely format, the number of masked lines and the lines worth reviewing by hand.
 
-### Windows: right-click menu
+### Right-click menu
 
-`run.bat` and `run_personal.bat` launch the two levels. To add them to the Send to menu, run this once from the folder where you keep netblur:
+**Windows.** `run.bat` and `run_personal.bat` launch the two levels. To add them to the Send to menu, run this once from the folder where you keep netblur:
 
 ```
 powershell -ExecutionPolicy Bypass -File install-sendto.ps1
 ```
 
 Then right-click one or more configuration files and choose Send to, "netblur (secrets only)" or "netblur (secrets and personal data)". On Windows 11 the Send to menu is under "Show more options", or press Shift+F10.
+
+**macOS and Linux.** Run this once from the folder where you keep netblur:
+
+```
+sh install-menu.sh
+```
+
+- macOS: two Quick Actions appear in Finder (right-click, Quick Actions). If they are missing, enable them in System Settings, Privacy & Security, Extensions, Finder.
+- GNOME Files (Nautilus), Nemo, Caja: right-click, Scripts.
+- Dolphin (KDE): right-click, netblur.
+
+The entries open the netblur window with the report. Where Python has no tkinter (on Debian and Ubuntu install `python3-tk`), netblur runs in the background and the report opens as a text file. `sh install-menu.sh --remove` removes every entry.
+
+### Window
+
+```
+netblur --gui
+```
+
+A small window to add files or folders, choose the level, type sensitive words, pick the output folder and read the report. It needs tkinter, which ships with Python on Windows and macOS. Inputs given on the command line are processed as soon as the window opens. The window runs the same code as the command line and never changes the originals.
 
 ### Limitations
 

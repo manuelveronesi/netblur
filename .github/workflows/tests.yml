@@ -3,6 +3,10 @@ name: tests
 on:
   push:
   pull_request:
+  schedule:
+    # Monthly run, so runner image or Python changes show up even when nothing is pushed.
+    - cron: '17 6 3 * *'
+  workflow_dispatch:
 
 jobs:
   test:

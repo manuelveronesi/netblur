@@ -91,13 +91,13 @@ The report shows the likely format, the number of masked lines and the lines wor
 
 ### Right-click menu
 
-**Windows.** `run.bat` and `run_personal.bat` launch the two levels. To add them to the Send to menu, run this once from the folder where you keep netblur:
+**Windows.** To add the two levels to the Send to menu, run this once from the folder where you keep netblur:
 
 ```
 powershell -ExecutionPolicy Bypass -File install-sendto.ps1
 ```
 
-Then right-click one or more configuration files and choose Send to, "netblur (secrets only)" or "netblur (secrets and personal data)". On Windows 11 the Send to menu is under "Show more options", or press Shift+F10.
+Then right-click one or more configuration files and choose Send to, "netblur (secrets only)" or "netblur (secrets and personal data)". The netblur window opens with the report. To get a console window instead, run the installer with `-Console`, or drag files onto `run.bat` and `run_personal.bat`. On Windows 11 the Send to menu is under "Show more options", or press Shift+F10.
 
 **macOS and Linux.** Run this once from the folder where you keep netblur:
 

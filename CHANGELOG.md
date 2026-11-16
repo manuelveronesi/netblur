@@ -3,6 +3,7 @@
 ### 3.3
 - `--gui`: a small window to choose files and folders, the level, sensitive words and the output folder, and to read the report
 - `install-menu.sh`: right-click entries on macOS (Finder Quick Actions) and Linux (GNOME Files, Nemo, Caja scripts, Dolphin service menu), with `--remove`
+- Windows: the Send to entries open the window through `pyw`, with no console; `install-sendto.ps1 -Console` keeps the console
 - Tests for the window and the menu installer; on Linux the suite runs under a virtual display
 
 ### 3.2

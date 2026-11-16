@@ -1,5 +1,10 @@
 ### netblur
 
+[![tests](https://github.com/manuelveronesi/netblur/actions/workflows/tests.yml/badge.svg)](https://github.com/manuelveronesi/netblur/actions/workflows/tests.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
+[![platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#right-click-menu)
+
 Mask passwords, keys and other secrets in network device configurations before you hand them to an AI for analysis. Optionally, blur the identity too: names, usernames, email addresses, phone numbers, hostnames, domains, public IP addresses, MAC addresses and any word you choose.
 
 It runs locally, needs nothing but Python and never connects to the Internet. Originals are never modified: you get a sanitized copy next to them.

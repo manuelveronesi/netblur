@@ -414,11 +414,57 @@ def test_menu(tmp):
     check('menu: --remove leaves nothing behind', p.returncode == 0 and not left, str(left)[:300])
 
 
+def test_plugin_guard(tmp):
+    work = tmp / 'guard'
+    work.mkdir()
+    shutil.copy(SAMPLES / 'fortigate.conf', work)
+    shutil.copy(SAMPLES / 'plain.conf', work)
+    (work / 'netblur_PERSONAL-DATA-MAP_x.json').write_text('{}', encoding='utf-8')
+    (work / 'app.py').write_text('password = "LEAK"\n', encoding='utf-8')
+    guard = ROOT / 'hooks' / 'netblur_guard.py'
+
+    def decision(tool, tool_input, env=None):
+        data = json.dumps({'cwd': str(work), 'tool_name': tool, 'tool_input': tool_input})
+        p = subprocess.run([sys.executable, '-I', str(guard)], input=data, capture_output=True, text=True,
+                           env=dict(os.environ, **(env or {})))
+        if p.returncode != 0 or not p.stdout.strip():
+            return 'allow'
+        return json.loads(p.stdout)['hookSpecificOutput']['permissionDecision']
+
+    check('guard: Read of a config with secrets is denied',
+          decision('Read', {'file_path': 'fortigate.conf'}) == 'deny')
+    check('guard: Read of a config without secrets is allowed',
+          decision('Read', {'file_path': str(work / 'plain.conf')}) == 'allow')
+    check('guard: Read of a netblur map is denied',
+          decision('Read', {'file_path': 'netblur_PERSONAL-DATA-MAP_x.json'}) == 'deny')
+    check('guard: source code is not checked', decision('Read', {'file_path': 'app.py'}) == 'allow')
+    check('guard: cat in a pipeline is denied',
+          decision('Bash', {'command': 'ls && cat fortigate.conf | head -5'}) == 'deny')
+    check('guard: Grep on the file is denied',
+          decision('Grep', {'pattern': 'set', 'path': 'fortigate.conf'}) == 'deny')
+    check('guard: Get-Content in PowerShell is denied',
+          decision('PowerShell', {'command': 'Get-Content -Path .\\fortigate.conf'}) == 'deny')
+    check('guard: running netblur on the file is allowed',
+          decision('Bash', {'command': 'python3 netblur.py fortigate.conf'}) == 'allow')
+    check('guard: NETBLUR_GUARD=off disables it',
+          decision('Read', {'file_path': 'fortigate.conf'}, {'NETBLUR_GUARD': 'off'}) == 'allow')
+    run(['fortigate.conf'], work)
+    check('guard: the sanitized copy is allowed',
+          decision('Read', {'file_path': 'fortigate_SANITIZED.conf'}) == 'allow')
+    manifest = json.loads((ROOT / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8'))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('netblur', str(SCRIPT))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    check('plugin: manifest version matches netblur', manifest['version'] == module.VERSION,
+          '%s != %s' % (manifest['version'], module.VERSION))
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix='netblur-tests-'))
     try:
         for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_freepbx,
-                     test_cli, test_identities, test_gui, test_menu):
+                     test_cli, test_identities, test_gui, test_menu, test_plugin_guard):
             print('--- ' + test.__name__)
             test(tmp)
     finally:

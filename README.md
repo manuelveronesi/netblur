@@ -124,6 +124,26 @@ netblur --gui
 
 A small window to add files or folders, choose the level, type sensitive words, pick the output folder and read the report. It needs tkinter, which ships with Python on Windows and macOS. Inputs given on the command line are processed as soon as the window opens. The window runs the same code as the command line and never changes the originals.
 
+### Use it with Claude
+
+netblur is also a plugin for Claude. It adds a skill that tells Claude to run netblur before analysing a configuration and to read only the sanitized copy, and, in Claude Code, a guard that enforces it.
+
+In Claude Code:
+
+```
+claude plugin marketplace add manuelveronesi/netblur
+claude plugin install netblur@netblur
+```
+
+What the plugin does:
+
+- **Skill.** When you ask Claude to analyse, troubleshoot or compare a firewall, router, switch, VPN or PBX configuration, Claude runs the bundled `netblur.py` on it, at level 1 or at level 2 when you want the customer not to be identifiable, and works only on the `_SANITIZED` or `_ANONYMIZED` copy. It never reads the level 2 map and gives you the `--restore` command to run yourself.
+- **Guard (Claude Code only).** A `PreToolUse` hook checks every file Claude is about to open with Read, with Grep on a single file, or with simple shell readers such as `cat`, `head`, `grep` and `Get-Content`. It runs the netblur engine on the file locally: if netblur would mask something, the call is denied and Claude is told to run netblur and read the copy. netblur maps and `_RESTORED` texts are always denied because they hold real values. Source code, documentation, media and archives are not checked, so the guard does not get in the way of ordinary work.
+
+The plugin runs locally, writes nothing except the copies netblur writes when Claude runs it, and sends nothing anywhere. The guard needs Python 3.9 or later (`python3`, `python` or `py`) and, on Windows, the Git Bash that Claude Code uses for hooks. To turn the guard off for a session, start Claude Code with the environment variable `NETBLUR_GUARD=off`.
+
+Two things the plugin cannot do. The guard is a safety net against mistakes, not a sandbox: a program written on purpose to read the file can still get around it. And once a file has been attached or uploaded to a conversation its content has already been shared: sanitize it before attaching it, or let Claude Code run netblur on your computer.
+
 ### Limitations
 
 Read these before relying on the output.

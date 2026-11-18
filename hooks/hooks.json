@@ -1,0 +1,17 @@
+{
+  "description": "netblur guard: stops Claude from reading a configuration file that still contains secrets and points it to the sanitized copy",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}\"/hooks/netblur-guard.sh",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

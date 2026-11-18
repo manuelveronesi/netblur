@@ -30,7 +30,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '3.3'
+VERSION = '3.4'
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s]+')
 

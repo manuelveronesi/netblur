@@ -1,5 +1,9 @@
 ### Changelog
 
+### 3.4
+- Claude plugin: a skill that runs netblur before Claude analyses a configuration and makes it read only the sanitized copy, and a Claude Code guard (`PreToolUse` hook) that denies reading a file netblur would still mask, a netblur map or a restored text
+- The repository doubles as a single-plugin marketplace (`claude plugin marketplace add manuelveronesi/netblur`)
+
 ### 3.3
 - `--gui`: a small window to choose files and folders, the level, sensitive words and the output folder, and to read the report
 - `install-menu.sh`: right-click entries on macOS (Finder Quick Actions) and Linux (GNOME Files, Nemo, Caja scripts, Dolphin service menu), with `--remove`

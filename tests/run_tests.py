@@ -458,6 +458,11 @@ def test_plugin_guard(tmp):
     spec.loader.exec_module(module)
     check('plugin: manifest version matches netblur', manifest['version'] == module.VERSION,
           '%s != %s' % (manifest['version'], module.VERSION))
+    directory = json.loads((ROOT / 'plugin' / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8'))
+    skill = (ROOT / 'plugin' / 'skills' / 'netblur' / 'SKILL.md').read_text(encoding='utf-8')
+    check('plugin: directory manifest version matches netblur', directory['version'] == module.VERSION,
+          '%s != %s' % (directory['version'], module.VERSION))
+    check('plugin: skill installs the current release', '/tags/v%s.zip' % module.VERSION in skill)
 
 
 def main():

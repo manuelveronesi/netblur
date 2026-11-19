@@ -3,6 +3,7 @@
 ### 3.4
 - Claude plugin: a skill that runs netblur before Claude analyses a configuration and makes it read only the sanitized copy, and a Claude Code guard (`PreToolUse` hook) that denies reading a file netblur would still mask, a netblur map or a restored text
 - The repository doubles as a single-plugin marketplace (`claude plugin marketplace add manuelveronesi/netblur`)
+- `plugin/`: the version for the Claude directory, with the skill only; it installs the pinned release with pip when netblur is missing, after asking
 
 ### 3.3
 - `--gui`: a small window to choose files and folders, the level, sensitive words and the output folder, and to read the report

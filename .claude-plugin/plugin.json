@@ -10,8 +10,6 @@
   },
   "homepage": "https://github.com/manuelveronesi/netblur",
   "repository": "https://github.com/manuelveronesi/netblur",
-  "documentationUrl": "https://github.com/manuelveronesi/netblur#use-it-with-claude",
-  "supportUrl": "https://github.com/manuelveronesi/netblur/issues",
   "license": "Apache-2.0",
   "keywords": [
     "network",
@@ -24,5 +22,8 @@
     "secrets",
     "redaction",
     "privacy"
+  ],
+  "skills": [
+    "./plugin/skills/"
   ]
 }

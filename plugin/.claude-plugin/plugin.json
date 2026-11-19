@@ -1,0 +1,26 @@
+{
+  "name": "netblur",
+  "displayName": "netblur",
+  "version": "3.4",
+  "description": "Has Claude mask passwords, keys and personal data in network and VoIP configurations with netblur, locally, and read only the sanitized copy",
+  "author": {
+    "name": "Manuel Veronesi",
+    "url": "https://github.com/manuelveronesi"
+  },
+  "homepage": "https://github.com/manuelveronesi/netblur",
+  "repository": "https://github.com/manuelveronesi/netblur",
+  "license": "Apache-2.0",
+  "keywords": [
+    "network",
+    "firewall",
+    "voip",
+    "3cx",
+    "asterisk",
+    "fortinet",
+    "cisco",
+    "secrets",
+    "redaction",
+    "privacy"
+  ],
+  "icon": "./.claude-plugin/icon.png"
+}

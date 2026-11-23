@@ -1,5 +1,14 @@
 ### Changelog
 
+### 3.5
+- Zyxel ZLD (USG, ZyWALL, ATP, USG FLEX): `password-encrypted` in AAA server groups and in `ad-server`/`ldap-server`, `keystring` and `encrypted-keystring` in `isakmp policy`, `server key` and `radius-server key`, `wpa-psk` and `wpa-psk-encrypted` in `wlan-security-profile`, `security ... psk key` and WEP `key1`-`key4` on WLAN interfaces
+- Any `$n$salt$hash` value is masked whatever keyword or format surrounds it, including Zyxel `$4$`
+- Compound keywords that configure passwords (`force-to-change-pwd`, `password-min-length`) are never treated as a password, and their lines are no longer flagged for review
+- Final check on every copy: `$n$...$` values and random-looking tokens still present are reported with their line numbers, the copy is never named `_NO-SECRETS-FOUND` and `--strict` exits with status 2
+- Level 2: usernames of Zyxel PPPoE and PPTP accounts
+- Running netblur on its own output no longer changes it: private key markers are no longer read as INI sections or as secret values
+- Plugin: both manifests at 3.5, the directory skill installs the v3.5 release
+
 ### 3.4
 - Claude plugin: a skill that runs netblur before Claude analyses a configuration and makes it read only the sanitized copy, and a Claude Code guard (`PreToolUse` hook) that denies reading a file netblur would still mask, a netblur map or a restored text
 - The repository doubles as a single-plugin marketplace (`claude plugin marketplace add manuelveronesi/netblur`)

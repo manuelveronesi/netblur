@@ -355,6 +355,87 @@ def test_identities(tmp):
     check('restore: refuses to run without a map', code == 1)
 
 
+def test_zyxel(tmp):
+    work = tmp / 'zyxel'
+    work.mkdir()
+    shutil.copy(SAMPLES / 'zyxel-zld.conf', work)
+    code, out = run(['zyxel-zld.conf'], work)
+    body = text(work / 'zyxel-zld_SANITIZED.conf')
+    check('zyxel: every ZLD secret masked', 'LEAK' not in body and '$4$' not in body)
+    for line in (' server password-encrypted REDACTED', ' encrypted-keystring REDACTED', ' keystring REDACTED',
+                 ' server key REDACTED', 'radius-server key REDACTED', ' wpa-psk REDACTED', ' wpa-psk-encrypted REDACTED',
+                 ' security wpa aes psk key REDACTED', ' encrypted-password REDACTED',
+                 'username admin encrypted-password REDACTED user-type admin'):
+        check('zyxel: "%s"' % line.strip(), line + '\n' in body)
+    check('zyxel: nothing left to review or suspicious', 'Lines to review locally: none flagged' in out
+          and 'possible secrets still' not in out, out[-400:])
+    # regression: the two values reported in the issue and the password setting that is not a password
+    lines = ('aaa group server ad AD1\n'
+             ' server password-encrypted $4$AbCdEfGh$Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg+/x$\n'
+             'isakmp policy VPN1\n'
+             ' encrypted-keystring $4$QwErTyUi$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo0NTY3$\n'
+             'no pwd-expiry force-to-change-pwd\n')
+    p = subprocess.run([sys.executable, '-I', str(SCRIPT), '-', '-o', '-'], cwd=str(work), input=lines.encode(),
+                       capture_output=True)
+    got = p.stdout.decode()
+    check('zyxel: password-encrypted value masked', ' server password-encrypted REDACTED\n' in got, got)
+    check('zyxel: encrypted-keystring value masked', ' encrypted-keystring REDACTED\n' in got, got)
+    check('zyxel: keyword without a value left unchanged', 'no pwd-expiry force-to-change-pwd\n' in got
+          and 'force-to-change-pwd REDACTED' not in got, got)
+    # lines without secrets stay byte for byte identical
+    plain = ('hostname ZYWALL-TEST\nno pwd-expiry force-to-change-pwd\nno pwd force-to-change-pwd\n'
+             'user-setting pwd-expiry force-to-change-pwd 30\npassword-encryption enable\nwpa-encrypt aes\n'
+             'isakmp policy VPN1\n authentication pre-share\n transform-set isakmp-algo aes256-sha256\n'
+             ' local-ip interface wan1\n exit\nip http secure-server cipher-suite aes256 aes128\n'
+             'wlan-security-profile OFFICE\n group-key 3600\n exit\n')
+    p = subprocess.run([sys.executable, '-I', str(SCRIPT), '-', '-o', '-'], cwd=str(work), input=plain.encode(),
+                       capture_output=True)
+    check('zyxel: lines without secrets unchanged', p.stdout.decode() == plain, p.stdout.decode())
+    check('zyxel: password settings not flagged for review', b'Lines to review locally: none flagged' in p.stderr,
+          p.stderr.decode()[-300:])
+
+
+def test_hashes_and_residual(tmp):
+    work = tmp / 'residual'
+    work.mkdir()
+    # $n$salt$hash goes whatever keyword precedes it, in any format
+    sample = ('custom-field $1$LEAKa$LEAKb\nnote $6$LEAKsalt$LEAKhash$ end\nother=$5$LEAKs$LEAKh$\n'
+              '{"opaque": "$9$LEAKj$LEAKk$"}\n<blob>$4$LEAKz$LEAKw$</blob>\n')
+    (work / 'hashes.conf').write_text(sample)
+    code, out = run(['hashes.conf'], work)
+    body = text(work / 'hashes_SANITIZED.conf')
+    check('hashes: $n$ values masked under any keyword', 'LEAK' not in body and 'note REDACTED end' in body, body)
+    # idempotent: sanitizing the copy again changes nothing
+    for name in ('hashes_SANITIZED.conf',):
+        first = (work / name).read_bytes()
+        p = subprocess.run([sys.executable, '-I', str(SCRIPT), '-', '-o', '-'], cwd=str(work), input=first,
+                           capture_output=True)
+        check('idempotent: %s' % name, p.stdout == first)
+    for sample_name in sorted(p.name for p in SAMPLES.iterdir()):
+        once = subprocess.run([sys.executable, '-I', str(SCRIPT), '-', '-o', '-'], cwd=str(work),
+                              input=(SAMPLES / sample_name).read_bytes(), capture_output=True).stdout
+        twice = subprocess.run([sys.executable, '-I', str(SCRIPT), '-', '-o', '-'], cwd=str(work),
+                               input=once, capture_output=True).stdout
+        check('idempotent: %s sanitized twice gives the same copy' % sample_name, once == twice)
+    # a random-looking value under an unknown keyword is reported with its line, never declared clean
+    (work / 'odd.conf').write_text('hostname test\nvendor-blob k9Qx7LmP2vRt8ZwB4nYc6Hd3\nexit\n')
+    code, out = run(['odd.conf', '--strict'], work)
+    check('residual: suspicious line reported with its number', 'check these lines before sharing it: 2' in out, out[-400:])
+    check('residual: copy not named as clean', not (work / 'odd_NO-SECRETS-FOUND.conf').exists()
+          and (work / 'odd_SANITIZED.conf').exists())
+    check('residual: --strict exits 2', code == 2)
+    check('residual: summary says the copies are not clean', 'NOT clean yet' in out)
+    # level 2: PPPoE usernames, public IPs and MACs with consistent placeholders
+    (work / 'isp.conf').write_text('account pppoe ISP_MAIN\n user isp-account-01\n password LEAKp\n exit\n'
+                                   'interface wan1\n ip address 82.121.34.5 255.255.255.248\n mac 00:11:22:33:44:55\n'
+                                   'ip route 0.0.0.0 0.0.0.0 82.121.34.1\nip dns server 82.121.34.5\n')
+    code, out = run(['-p', 'isp.conf', '-o', 'p2', '--no-map'], work)
+    isp = text(work / 'p2' / 'isp_ANONYMIZED.conf')
+    check('level 2: PPPoE username replaced', 'isp-account-01' not in isp and ' user USER_1' in isp, isp)
+    check('level 2: same public IP, same placeholder', isp.count('192.0.2.1') == 2 and '82.121' not in isp, isp)
+    check('level 2: MAC replaced, private and mask kept', '00:11:22' not in isp and '255.255.255.248' in isp)
+
+
 def test_gui(tmp):
     work = tmp / 'gui'
     work.mkdir()
@@ -469,7 +550,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix='netblur-tests-'))
     try:
         for test in (test_samples, test_personal, test_rejections, test_fortinet_multipart, test_zip, test_3cx, test_freepbx,
-                     test_cli, test_identities, test_gui, test_menu, test_plugin_guard):
+                     test_cli, test_identities, test_zyxel, test_hashes_and_residual, test_gui, test_menu,
+                     test_plugin_guard):
             print('--- ' + test.__name__)
             test(tmp)
     finally:

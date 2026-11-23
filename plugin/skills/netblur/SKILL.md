@@ -18,7 +18,7 @@ Never read, grep, print or paste the original configuration. Run netblur first a
 3. Otherwise check whether netblur is installed with `<python> -m netblur --version`. If it is, `NETBLUR` means `<python> -m netblur`.
 4. If it is not installed, ask the user before installing it, then install the pinned release from its GitHub repository:
    ```
-   <python> -m pip install --user "https://github.com/manuelveronesi/netblur/archive/refs/tags/v3.4.zip"
+   <python> -m pip install --user "https://github.com/manuelveronesi/netblur/archive/refs/tags/v3.5.zip"
    ```
    It installs one Python module and no dependencies. Then use `<python> -m netblur`.
 

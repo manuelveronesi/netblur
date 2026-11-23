@@ -2,7 +2,7 @@
   "name": "netblur",
   "displayName": "netblur",
   "icon": "./.claude-plugin/icon.png",
-  "version": "3.4",
+  "version": "3.5",
   "description": "Masks passwords, keys and personal data in network and VoIP configurations locally, so Claude only reads a sanitized copy",
   "author": {
     "name": "Manuel Veronesi",

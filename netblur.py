@@ -23,6 +23,7 @@ import codecs
 import gzip
 import io
 import json
+import math
 import re
 import sys
 import tarfile
@@ -30,7 +31,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '3.4'
+VERSION = '3.5'
 
 TOKEN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s]+')
 
@@ -40,7 +41,9 @@ CLI_KEY = re.compile(r'''^(?:[a-z0-9]+[-_])*(?:
     pre-?share|pre-?shared-?key|presharekey|pre-?shared-?secret|preshared-?key|
     community|key-string|private-key|privkey|auth-key|md5-keys?|
     authentication-key|message-digest-key|ipsec-secret|password-encrypt|
-    psk-passphrase|wpa-passphrase|token|api-?key|apikey|engineid)$
+    psk-passphrase|wpa-passphrase|token|api-?key|apikey|engineid|keystring|wep-?key\d?)$
+    |^(?:[a-z0-9]+[-_])*(?:password|passwd|pwd|secret|psk|keystring|key|community)[-_]encrypt(?:ed)?$
+    |^key[1-4]$
     |^(?:auth|priv)-[a-z0-9-]+-key$
     |^(?:auth|priv)-(?:md5|sha\d*|des|3des|aes\d*)$''', re.X)
 
@@ -73,6 +76,13 @@ NOT_SECRET_NEXT = {
     'expiration', 'lockout', 'length', 'strength', 'recovery', 'reset', 'required', 'change',
     'type', 'mode', '=',
 }
+# Parts of a compound keyword that make it a setting about passwords, not a password:
+# force-to-change-pwd, password-min-length, pwd-history.
+SETTING_PARTS = {
+    'expiry', 'expire', 'expires', 'expiration', 'aging', 'age', 'history', 'length', 'len', 'min', 'max',
+    'minimum', 'maximum', 'policy', 'complexity', 'change', 'force', 'reuse', 'lockout', 'strength',
+    'retry', 'reset', 'prompt', 'recovery', 'encryption', 'rule', 'rules', 'check', 'format', 'type', 'mode',
+}
 AUTH_PREV = {'authentication', 'auth', 'authmethod', 'method', 'mode', 'type', 'authentication-method'}
 PSK_WORDS = {'pre-share', 'preshare', 'psk', 'pre-shared-key'}
 KEY_NOT_NEXT = {
@@ -81,8 +91,11 @@ KEY_NOT_NEXT = {
 }
 KEY_NOT_PREV = {'crypto', 'ssh', 'public', 'pubkey', 'host-key', 'rsa'}
 
-# Recognisable hashes and ciphertexts wherever they appear (Cisco/Linux $1$ $5$ $8$ $9$, Juniper $9$, Huawei %^%#).
-HASHTOKEN = re.compile(r'^["\']?(?:\$(?:1|2[abxy]?|5|6|7|8|9|y|sha1|sha256|sha512|pbkdf2[\w-]*)\$\S+|%\^%#\S+|%\$%\$\S+)')
+# Recognisable hashes and ciphertexts as whole CLI tokens: $n$... in any numbering (Cisco, Linux, Juniper $9$,
+# Zyxel $4$), bcrypt $2b$, yescrypt $y$, Huawei %^%# and %$%$.
+HASHTOKEN = re.compile(r'^["\']?(?:\$(?:\d{1,2}[a-z]?|y|sha1|sha256|sha512|pbkdf2[\w-]*)\$\S+|%\^%#\S+|%\$%\$\S+)')
+# The same $n$salt$hash shape anywhere in a line, whatever keyword or format surrounds it.
+HASH_ANY = re.compile(r'(?<![\w$])\$(?:\d{1,2}[a-z]?|y|sha1|sha256|sha512|pbkdf2[\w-]*)\$[^\s$"\'<>,;]+\$[^\s"\'<>,;]*')
 
 # Secret field names for key=value, JSON and XML formats.
 SECRET_NAME = re.compile(
@@ -128,13 +141,15 @@ PEM_END = re.compile(r'-----END (?:[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?|OpenVPN Stat
 EXOS_ACCOUNT = re.compile(r'(\baccount\s+(?:admin\s+|user\s+)?\S+\s+encrypted\s+)("(?:\\.|[^"\\])*"|\S+)', re.I)
 SNMP_HOST = re.compile(r'^(\s*snmp-server\s+host\s+\S+(?:\s+(?:informs|traps))?(?:\s+version\s+(?:1|2c))?\s+)'
                        r'(?!(?:informs|traps|version|vrf)\b)(\S+)', re.I)
-BENIGN = re.compile(r'service password-encryption|password encryption|authentication pre-share|'
+BENIGN = re.compile(r'service password-encryption|password[ -]encryption|authentication pre-share|'
                     r'crypto key generate|^\s*key chain\b|^\s*key \d+\s*$|authmethod psk|psk-type|'
                     r'mode pre-shared-secret|-password ""|authentication-types=|^/(?:ppp secret|snmp community)|'
                     r'^\s*config system snmp community|"key"\s*:\s*"|_required"\s*:|'
                     r'^\s*config\s|^\s*set type password\s*$|^\s*set \S*cipher\S*\s|^\s*set \S*(?:password|passwd|pwd)\S* \d+\s*$|'
                     r'^\s*(?:CREATE TABLE|PRIMARY KEY|UNIQUE KEY|KEY `|`\w+` (?:varchar|text|int|char|tinyint|bigint|blob|datetime))|'
-                    r'password_format\s*=|"(?:filename|pathto|path|file)"\s*:', re.I)
+                    r'password_format\s*=|"(?:filename|pathto|path|file)"\s*:|'
+                    r'\b(?:pwd|password)-(?:expiry|expire|aging|history|length|policy|complexity|min\S*|max\S*)\b|'
+                    r'force-to-change-(?:pwd|password)|^\s*ip http secure-server\b|^\s*group-key \d+\s*$', re.I)
 REVIEW_IGNORE = re.compile(r'\w*(?:secret|pass\w*|pwd|pin|key|token)\w*=(?:""|\'\')|"\w*(?:secret|pass\w*|pwd|pin|key|token)\w*"\s*:\s*""|<(Name|name|Description|description)>[^<]*</\1>|'
                            r'"(?:keyword|attribute|setting|option|param|parameter|property|variable)"\s*:\s*"[^"]*"|'
                            r'[\'`"]\w*(?:secret|pass\w*|pwd|pin|key|token)\w*[\'`"]\s*[,)]|^\s*\[[^\]]+\]\s*$', re.I | re.M)
@@ -464,6 +479,12 @@ def sql_statement_ends(body, start):
     return False
 
 
+def is_setting_word(word):
+    """force-to-change-pwd, password-min-length: compound keywords that configure passwords."""
+    parts = re.split(r'[-_]', word)
+    return len(parts) > 1 and any(p in SETTING_PARTS for p in parts)
+
+
 def secret_keyword(i, words, raw):
     n = len(words)
     if i + 1 >= n:
@@ -481,8 +502,9 @@ def secret_keyword(i, words, raw):
     if w == 'encrypted':
         return nxt not in SAFE_FOLLOW
     if CLI_KEY.match(w):
-        if nxt in NOT_SECRET_NEXT:
-            return False
+        if nxt in NOT_SECRET_NEXT or is_setting_word(w) or (is_setting_word(nxt) and CLI_KEY.match(nxt)):
+            return False  # a setting about passwords (force-to-change-pwd), not a password
+
         if w in PSK_WORDS and prev in AUTH_PREV:
             return False
         return True
@@ -514,10 +536,10 @@ def scan_cli(body, ctx, taken):
             if j >= n:
                 break
             skips = 0
-            while j < n - 1 and words[j] in MODIFIERS and skips < 4:
-                j += 1
+            while j < n - 1 and (words[j] in MODIFIERS or words[j] == 'key') and skips < 4:
+                j += 1  # "psk key X", "encryption aes128 key X": the word key is not the value
                 skips += 1
-            if raw[j] in ('""', "''") or words[j].strip('"\'') == 'redacted':
+            if raw[j] in ('""', "''") or words[j].strip('"\'') in ('redacted', PEM_MARK.lower()):
                 i = j + 1
                 continue
             if j + 1 < n and words[j + 1] in SAFE_FOLLOW:
@@ -536,7 +558,7 @@ def scan_cli(body, ctx, taken):
 def update_sections(body, ctx):
     s = body.strip()
     m = INI_SECTION.match(body)
-    if m and not s.startswith('[['):
+    if m and not s.startswith(('[[', PEM_MARK)):  # our own private key marker is not an INI section
         name = m.group(1).strip()
         ctx.ini_secret = is_secret_name(name) and not name.startswith(('"', "'"))
     m = re.match(r'^config\s+(.+?)\s*$', s)
@@ -575,6 +597,8 @@ def clean_line(line, ctx):
 
     # Secret XML element spanning several lines.
     if ctx.xml_open:
+        if body.strip() == PEM_MARK:
+            return line, False  # already masked on an earlier pass
         close = re.search(r'</' + re.escape(ctx.xml_open) + r'\s*>', body)
         if close:
             ctx.xml_open = None
@@ -648,6 +672,8 @@ def clean_line(line, ctx):
                     spans.append((m.start(2), m.end(2), mask(m.group(2))))
     if not is_json and not is_xml and not is_sql and not stripped.startswith('/'):
         spans += scan_cli(body, ctx, spans)
+    # $n$salt$hash values go whatever precedes them.
+    spans += [(m.start(), m.end(), 'REDACTED') for m in HASH_ANY.finditer(body) if not spans_cover(spans, m.start())]
     if not spans:
         return line, bool(ctx.xml_open and not was_open)
     # Drop overlaps, keeping the widest span.
@@ -717,6 +743,53 @@ def redact(text):
     return ''.join(output), changed, review
 
 
+RESIDUAL_TOKEN = re.compile(r'(?<![\w+/=-])[A-Za-z0-9+/=_-]{20,}(?![\w+/=-])')
+UUID = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+PUBLIC_KEY_LINE = re.compile(r'\b(?:ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-\S+|sk-ssh-\S+)\s+AAAA')
+
+
+def entropy(token):
+    counts = {}
+    for c in token:
+        counts[c] = counts.get(c, 0) + 1
+    n = len(token)
+    return -sum(k / n * math.log2(k / n) for k in counts.values())
+
+
+def looks_random(token):
+    """A token that looks like a key, a hash or a ciphertext rather than a word or a name."""
+    if UUID.match(token):
+        return False
+    parts = token.strip('/').split('/')
+    if len(parts) > 2 and all(re.fullmatch(r'[A-Za-z]+|\d+', p) for p in parts):
+        return False  # a path such as AMPUSER/103/password
+    # Identifiers are words joined by - or _; keys and ciphertexts have long stretches without them.
+    for seg in re.split(r'[-_]', token.rstrip('=')):
+        if len(seg) < 16:
+            continue
+        if re.fullmatch(r'[0-9a-fA-F]{32,}', seg):
+            return True  # long hexadecimal: digests and raw keys
+        classes = sum(bool(re.search(rx, seg)) for rx in (r'[a-z]', r'[A-Z]', r'\d', r'[+/]'))
+        if classes >= 3 and entropy(seg) >= 3.8:
+            return True
+    return False
+
+
+def residual_check(text):
+    """Line numbers of the sanitized text that still hold a $n$...$ value or a random-looking token."""
+    found, in_cert = [], False
+    for number, line in enumerate(text.splitlines(), 1):
+        starts_cert = bool(CERT_BEGIN.search(line))
+        skip = in_cert or starts_cert or PUBLIC_KEY_LINE.search(line)
+        if starts_cert:
+            in_cert = True
+        if CERT_END.search(line):
+            in_cert = False
+        if HASH_ANY.search(line) or (not skip and any(looks_random(m.group()) for m in RESIDUAL_TOKEN.finditer(line))):
+            found.append(number)
+    return found
+
+
 def decode(raw):
     if raw.startswith(b'PK\x03\x04') or raw.startswith(b'\x1f\x8b') or raw.startswith(b'Rar!') \
             or raw.startswith(b'7z\xbc\xaf'):  # ZIP archives are handled before decode() is called
@@ -761,6 +834,9 @@ AST_CALLERID = re.compile(r'(?i)^\s*(?:callerid|cid_name|calleridname|fullname|o
 AST_USER = re.compile(r'(?i)^\s*(?:username|fromuser|defaultuser|authuser|auth_username|remoteuser|user_name)\s*=>?\s*(\S+)')
 USER_KEYS = re.compile(r'(?i)"(?:username|fromuser|defaultuser|authuser|auth_username|user_name)"\s*:\s*"([^"]+)"')
 NAME_SET = re.compile(r'(?i)^\s*set (first-name|last-name|fullname|full-name|display-name|contact|company) (".*?"|\S+)')
+# Zyxel ZLD ISP accounts: "account pppoe NAME" opens a block whose "user" line is the provider username.
+ZYXEL_ACCOUNT = re.compile(r'(?i)^\s*account\s+(?:pppoe|pptp)\s+\S+')
+ZYXEL_ACCOUNT_USER = re.compile(r'(?i)^\s+user\s+("[^"]+"|\S+)\s*$')
 USER_CMD = re.compile(r'(?i)^\s*(?:no\s+)?(?:username|user name|users passwd|local-user)\s+("[^"]+"|\S+)')
 GENERIC_ACCOUNTS = {'admin', 'administrator', 'root', 'guest', 'operator', 'support', 'user', 'users', 'monitor',
                     'readonly', 'read-only', 'maintenance', 'ubnt', 'cisco', 'manager', 'default', 'test', 'service',
@@ -963,7 +1039,16 @@ class Privacy:
             self.collect_sql(text)
         forti, ros = [], ''
         since_extension = since_tech = 99
+        isp_account = False
         for line in text.splitlines():
+            if ZYXEL_ACCOUNT.match(line):
+                isp_account = True
+            elif isp_account and (line.strip() == 'exit' or (line[:1].strip() and line.strip())):
+                isp_account = False
+            elif isp_account:
+                m = ZYXEL_ACCOUNT_USER.match(line)
+                if m:
+                    self.add_user(m.group(1))
             # FreePBX module data: {"extension": "101", ..., "name": "John Smith"} and devices with "description".
             since_extension = 0 if re.search(r'"extension"\s*:\s*"\d+"', line) else since_extension + 1
             since_tech = 0 if re.search(r'"(?:tech|devicetype)"\s*:\s*"', line) else since_tech + 1
@@ -1246,15 +1331,16 @@ STDIO = '-'
 class Result:
     """What came out of one input file."""
 
-    def __init__(self, data, changed, review, blocks, text, personal_hits):
+    def __init__(self, data, changed, review, blocks, text, personal_hits, residual=()):
         self.data, self.changed, self.review = data, changed, review
         self.blocks, self.text, self.personal_hits = blocks, text, personal_hits
+        self.residual = list(residual)  # lines of the copy that still look like they hold a secret
 
 
 def sanitize_bytes(raw, privacy=None):
     if is_multipart(raw):
         data, changed, review, blocks, hits = redact_multipart(raw, privacy)
-        return Result(data, changed, review, blocks, None, hits)
+        return Result(data, changed, review, blocks, None, hits, residual_check(data.decode('latin-1')))
     text, enc = decode(raw)
     result, changed, review = redact(text)
     hits = 0
@@ -1262,7 +1348,7 @@ def sanitize_bytes(raw, privacy=None):
         privacy.collect(result)
         result, counts = privacy.apply(result)
         hits = sum(counts.values())
-    return Result(result.encode(enc), changed, review, None, text, hits)
+    return Result(result.encode(enc), changed, review, None, text, hits, residual_check(result))
 
 
 def is_own_output(name):
@@ -1366,7 +1452,7 @@ class Run:
             self.privacy = Privacy(words=words, ip_mode=ip_mode, macs=not args.keep_macs)
         self.to_stdout = args.output == STDIO
         self.log = sys.stderr if self.to_stdout else sys.stdout
-        self.failed = self.skipped = self.flagged = self.no_secrets = self.written = 0
+        self.failed = self.skipped = self.flagged = self.no_secrets = self.written = self.residual = 0
         self.outputs = []          # paths written, in order
         self.sources = []          # input labels, for the map file
         self.output_dir = None     # set when -o names a directory
@@ -1377,7 +1463,7 @@ class Run:
 
     # ---------------------------------------------------------------- destinations
     def tag(self, result):
-        if not result.changed and not result.personal_hits:
+        if not result.changed and not result.personal_hits and not result.residual:
             return '_NO-SECRETS-FOUND'
         return '_ANONYMIZED' if self.args.personal else '_SANITIZED'
 
@@ -1428,10 +1514,19 @@ class Run:
             self.flagged += len(result.review)
         else:
             self.say('Lines to review locally: none flagged')
-        if not result.changed and not result.personal_hits:
+        self.report_residual(result.residual)
+        if not result.changed and not result.personal_hits and not result.residual:
             self.no_secrets += 1
             self.say('WARNING: no secrets found. Check that the file is a configuration and that its')
             self.say('syntax is supported, and review the copy before sharing it.')
+
+    def report_residual(self, residual, label=''):
+        """Values that survived sanitization and still look like secrets: the copy is not declared clean."""
+        if not residual:
+            return
+        self.residual += len(residual)
+        shown = ', '.join(map(str, residual[:40])) + (' and %d more' % (len(residual) - 40) if len(residual) > 40 else '')
+        self.say('%sWARNING: possible secrets still in the copy, check these lines before sharing it: %s' % (label, shown))
 
     # ---------------------------------------------------------------- inputs
     def handle_bytes(self, raw, src, rel_parent, stem, suffix, label):
@@ -1525,7 +1620,7 @@ class Run:
             self.say('  Skipped: %-28s %5d file(s) %10.1f MB' % (reason, n, size / 1048576))
         if not results:
             raise ValueError('The archive holds no text files to process.')
-        any_change = any(r.changed or r.personal_hits for _, r in results)
+        any_change = any(r.changed or r.personal_hits or r.residual for _, r in results)
         tag = ('_ANONYMIZED' if self.args.personal else '_SANITIZED') if any_change else '_NO-SECRETS-FOUND'
         base = self.output_dir / rel_parent if self.output_dir is not None else src.parent
         base.mkdir(parents=True, exist_ok=True)
@@ -1549,6 +1644,9 @@ class Run:
                     extra += '; review lines ' + shown + (' ...' if len(result.review) > 20 else '')
                     self.flagged += len(result.review)
                 self.say('  %s: %d line(s) masked%s' % (rel.as_posix(), len(result.changed), extra))
+                self.report_residual(result.residual, '  %s: ' % rel.as_posix())
+            elif result.residual:
+                self.report_residual(result.residual, '  %s: ' % rel.as_posix())
             else:
                 untouched.append(rel.as_posix())
                 if result.review:
@@ -1679,7 +1777,7 @@ def build_parser():
     parser.add_argument('--restore', action='store_true',
                         help='put the real values back into a text (for example an AI answer) using the map given with -m')
     parser.add_argument('--strict', action='store_true',
-                        help='exit with status 2 when lines are flagged for review or a file had no secrets')
+                        help='exit with status 2 when lines are flagged for review, possible secrets are left or a file had no secrets')
     parser.add_argument('--force', action='store_true',
                         help='allow overwriting the file named by -o or -m (never the originals)')
     parser.add_argument('--gui', action='store_true',
@@ -1990,11 +2088,14 @@ def main(argv=None, outputs=None):
     run.say()
     run.say('Done: %d file(s) written, %d skipped, %d error(s), %d line(s) to review, %d file(s) without secrets.'
             % (run.written, run.skipped, run.failed, run.flagged, run.no_secrets))
+    if run.residual:
+        run.say('WARNING: %d line(s) still look like they hold a secret (see above): the copies are NOT clean yet.'
+                % run.residual)
     run.say('Manual review always required: complete coverage is not guaranteed.')
     run.say('Do not restore these copies onto devices.')
     if run.failed:
         return 1
-    if args.strict and (run.flagged or run.no_secrets):
+    if args.strict and (run.flagged or run.no_secrets or run.residual):
         return 2
     return 0
 

@@ -24,7 +24,7 @@ Pasting a firewall config into a chat is one of the fastest ways to troubleshoot
 | XML | WatchGuard, pfSense, OPNsense, 3CX `Db.xml` |
 | SQL dumps | MySQL/MariaDB `INSERT` rows and PostgreSQL `COPY` blocks: secret columns are found through `CREATE TABLE`, keyword/data tables (FreePBX `sip`, `pjsip`, `iax`) through the keyword name |
 | Private keys | PEM blocks and OpenVPN static keys, including multi-line FortiGate `set private-key` values |
-| Hashes and ciphertexts | `$1$`, `$5$`, `$6$`, `$8$`, `$9$`, Huawei `%^%#`, anything after Fortinet `ENC` |
+| Hashes and ciphertexts | any `$n$salt$hash` value (`$1$`, `$4$` Zyxel, `$5$`, `$6$`, `$8$`, `$9$`...) whatever keyword or format surrounds it, Huawei `%^%#`, anything after Fortinet `ENC` |
 | Embedded credentials | `user:password@host` in URLs and in Fortinet backup or automation scripts |
 | SNMPv3 | `auth-*-key`, `priv-*-key`, plaintext `auth-sha512 <password>` forms, engine IDs |
 
@@ -43,7 +43,7 @@ Public certificates and public keys (`BEGIN CERTIFICATE`, `BEGIN PUBLIC KEY`) ar
 | Level | Command | Copy suffix | What is replaced |
 | --- | --- | --- | --- |
 | 1, secrets only | `netblur FILE` | `_SANITIZED` | passwords, keys, communities, PINs, tokens, hashes |
-| 2, secrets and identity | `netblur --personal FILE` | `_ANONYMIZED` | the above, plus names, usernames, email addresses, phone numbers, hostnames, domains, public IP addresses, MAC addresses and the words you pass with `-w` |
+| 2, secrets and identity | `netblur --personal FILE` | `_ANONYMIZED` | the above, plus names, usernames, email addresses, phone numbers, hostnames, domains, public IP addresses, MAC addresses, PPPoE and PPTP usernames and the words you pass with `-w` |
 
 At level 2 the values are replaced with consistent placeholders: `NAME_1`, `USER_1`, `EMAIL_1`, `PHONE_1`, `HOST_1`, `example-1.net`, `WORD_1`, public addresses from the documentation ranges (`192.0.2.1`, `198.51.100.1`, `203.0.113.1`, then `198.18.0.0/15`), IPv6 under `2001:db8::/32` and locally administered MACs (`02:00:00:00:00:01`). The same value always gets the same placeholder, across every file of the run, so the AI can still follow forwarding rules, BGP peers, group memberships and routing without knowing who or where. Private addresses, netmasks, wildcard masks, multicast and well-known public resolvers stay readable, and `--all-ips`, `--keep-ips` and `--keep-macs` change that.
 
@@ -51,7 +51,7 @@ At level 2 the values are replaced with consistent placeholders: `NAME_1`, `USER
 
 A JSON map links each placeholder to the real value. `netblur --restore answer.txt -m map.json` puts the real values back into the AI's answer, so you can act on it. Both files contain real data: keep them local and never share them.
 
-When nothing is found to mask, the copy gets the `_NO-SECRETS-FOUND` suffix and a warning is shown, because zero secrets can also mean a syntax the tool doesn't know. Existing files are never overwritten: a new copy with date and time in its name is created instead.
+When nothing is found to mask, the copy gets the `_NO-SECRETS-FOUND` suffix and a warning is shown, because zero secrets can also mean a syntax the tool doesn't know. After masking, every copy is checked again for `$n$...$` values and random-looking tokens such as keys and ciphertexts: if any are left, their line numbers are reported and the copy is never named as clean. Existing files are never overwritten: a new copy with date and time in its name is created instead.
 
 ### Install
 
@@ -87,7 +87,7 @@ netblur config.conf -o out/ --strict
 | `--no-map` | Do not write the map file |
 | `--restore` | Put the real values back into a text using the map given with `-m` (output: `_RESTORED` copy, or `-o`) |
 | `--gui` | Open the window instead of printing to the terminal (exit status 3 when tkinter or a display is missing) |
-| `--strict` | Exit with status 2 when lines are flagged for review or a file had no secrets (useful in scripts and CI) |
+| `--strict` | Exit with status 2 when lines are flagged for review, possible secrets are left in a copy or a file had no secrets (useful in scripts and CI) |
 | `--force` | Allow overwriting the file named by `-o` or `-m`, never the originals |
 
 Exit codes: 0 success, 1 an input could not be processed, 2 `--strict` findings or wrong usage, 3 `--gui` not available.

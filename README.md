@@ -128,7 +128,7 @@ A small window to add files or folders, choose the level, type sensitive words, 
 
 netblur is also a plugin for Claude, in two versions with the same skill. The skill tells Claude to run netblur before analysing a configuration and to read only the sanitized copy.
 
-**From the Claude directory** (Claude, Cowork and Claude Code): the `plugin/` folder of this repository. It holds the skill and a copy of `netblur.py`, which Claude runs as it is: nothing is downloaded or installed.
+**From the Claude directory** (Claude, Cowork and Claude Code): the `plugin/` folder of this repository. It holds only the skill and its instructions. If netblur is not installed where Claude works, Claude asks before installing the release package from this repository with pip, pinned by version and SHA-256 checksum.
 
 **With the guard, for Claude Code**: the repository root, which bundles `netblur.py` and adds a guard. Install it from this repository's own marketplace:
 

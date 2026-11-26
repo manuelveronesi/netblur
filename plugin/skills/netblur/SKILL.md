@@ -14,7 +14,12 @@ Never read, grep, print or paste the original configuration. Run netblur first a
 ### Find netblur
 
 1. Find the Python command: `python3`, then `python`, then `py` on Windows. If none works, tell the user that netblur needs Python 3.9 or later (on Windows `winget install Python.Python.3.13`) and stop.
-2. netblur ships with this plugin: in the commands below, `NETBLUR` means `<python> "${CLAUDE_PLUGIN_ROOT}/netblur.py"`. Always use this copy. Do not download or install netblur from anywhere else.
+2. Check whether netblur is installed with `<python> -m netblur --version`. If it is, `NETBLUR` means `<python> -m netblur`. If it reports a version older than 3.7, offer to upgrade it with the command below.
+3. If it is not installed, ask the user before installing it, then install the release pinned by version and SHA-256 checksum. pip refuses the file if its checksum is different:
+   ```
+   <python> -m pip install --user "https://github.com/manuelveronesi/netblur/releases/download/v3.7/netblur-3.7-py3-none-any.whl#sha256=ba9f49243b838172c1f2f774db3151c0395d9df3323b76d270634d4732c202d1"
+   ```
+   It installs one Python module and no dependencies. Then use `<python> -m netblur`. Never install netblur from any other address.
 
 ### Steps
 

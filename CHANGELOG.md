@@ -1,5 +1,9 @@
 ### Changelog
 
+### 3.7
+- `plugin/`: back to instructions only, as the Claude directory accepts no Python files from publishers that are not verified organizations. When netblur is missing, the skill asks and then installs the wheel attached to the GitHub release, pinned by version and SHA-256 checksum
+- Tests check that `plugin/` holds only Markdown, JSON, images and the license, and that the skill pins both version and checksum
+
 ### 3.6
 - `plugin/`: the directory version ships `netblur.py` and the skill always runs that copy, so nothing is downloaded or installed. The pip install from the GitHub release is gone
 - Tests check that `plugin/netblur.py` is identical to `netblur.py` and that the skill installs nothing

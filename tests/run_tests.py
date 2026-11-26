@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -543,11 +544,13 @@ def test_plugin_guard(tmp):
     skill = (ROOT / 'plugin' / 'skills' / 'netblur' / 'SKILL.md').read_text(encoding='utf-8')
     check('plugin: directory manifest version matches netblur', directory['version'] == module.VERSION,
           '%s != %s' % (directory['version'], module.VERSION))
-    check('plugin: directory version ships the current netblur.py',
-          (ROOT / 'plugin' / 'netblur.py').read_bytes() == SCRIPT.read_bytes(),
-          'copy netblur.py into plugin/ after changing it')
-    check('plugin: skill runs the bundled copy and installs nothing',
-          '${CLAUDE_PLUGIN_ROOT}/netblur.py' in skill and 'pip install' not in skill and 'https://' not in skill)
+    allowed = {'.md', '.json', '.png'}
+    extra = [p.relative_to(ROOT).as_posix() for p in (ROOT / 'plugin').rglob('*')
+             if p.is_file() and p.suffix.lower() not in allowed and p.name != 'LICENSE']
+    check('plugin: directory version holds only Markdown, JSON, images and the license', not extra, extra)
+    check('plugin: skill pins the release by version and checksum', re.search(
+        r'/releases/download/v%s/netblur-%s-py3-none-any\.whl#sha256=[0-9a-f]{64}"' % (
+            re.escape(module.VERSION), re.escape(module.VERSION)), skill) is not None)
 
 
 def main():

@@ -1,5 +1,9 @@
 ### Changelog
 
+### 3.6
+- `plugin/`: the directory version ships `netblur.py` and the skill always runs that copy, so nothing is downloaded or installed. The pip install from the GitHub release is gone
+- Tests check that `plugin/netblur.py` is identical to `netblur.py` and that the skill installs nothing
+
 ### 3.5
 - Zyxel ZLD (USG, ZyWALL, ATP, USG FLEX): `password-encrypted` in AAA server groups and in `ad-server`/`ldap-server`, `keystring` and `encrypted-keystring` in `isakmp policy`, `server key` and `radius-server key`, `wpa-psk` and `wpa-psk-encrypted` in `wlan-security-profile`, `security ... psk key` and WEP `key1`-`key4` on WLAN interfaces
 - Any `$n$salt$hash` value is masked whatever keyword or format surrounds it, including Zyxel `$4$`

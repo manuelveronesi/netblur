@@ -14,7 +14,7 @@ Supported formats include Fortinet, Cisco IOS and ASA, Zyxel, MikroTik, Juniper,
 
 ### What it runs and where data goes
 
-The plugin itself contains only instructions for Claude. netblur is a single Python module (Python 3.9 or later, no dependencies) that runs on the machine where Claude works, writes the sanitized copies next to the originals and never connects to the Internet. If netblur is not installed, Claude asks you before installing the pinned release with pip from the project's GitHub repository. Nothing is sent anywhere by the plugin or by netblur.
+The plugin contains the instructions for Claude and netblur itself, a single Python module (Python 3.9 or later, no dependencies) that runs on the machine where Claude works, writes the sanitized copies next to the originals and never connects to the Internet. Claude runs the copy that ships with the plugin, so nothing is downloaded or installed. Nothing is sent anywhere by the plugin or by netblur.
 
 netblur protects a file only if it runs before the file reaches the conversation. A file you have already attached or uploaded has already been shared: sanitize it on your computer first, or let Claude Code run netblur locally.
 
